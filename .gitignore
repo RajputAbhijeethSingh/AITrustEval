@@ -1,0 +1,28 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+
+# VS Code
+.vscode/
+
+# Uploaded datasets
+data/input/*
+
+# Evaluation results
+outputs/results/*
+
+# Generated reports and graphs
+outputs/reports/*
+outputs/graphs/*
+
+# Logs
+*.log
