@@ -1,176 +1,671 @@
-import streamlit as st
+"""
+AITrustEval - Professional Streamlit Dashboard
+
+Offline AI/ML Trustworthiness, Security & Reliability
+Evaluation Platform.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
 import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
 # ============================================================
-# STREAMLIT SESSION STATE
+# PROJECT ROOT
 # ============================================================
 
-SESSION_DEFAULTS = {
-    "analysis_completed": False,
-    "evaluation": None,
-    "results_df": None,
-    "ragas_results": None,
-    "security_results": None,
-    "security_summary": None,
-    "reliability_results": None,
-    "failure_summary": None,
-    "root_cause_df": None,
-    "dataset_info": None,
-    "detected_columns": None,
-    "availability": None,
-}
+PROJECT_ROOT = Path(
+    __file__
+).resolve().parents[1]
 
-for key, default_value in SESSION_DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = default_value
-from evaluation.dataset.data_loader import (
-    load_dataset,
-    get_dataset_info
-)
 
-from evaluation.dataset.schema_detector import (
-    validate_dataset
-)
-
-from evaluation.dataset.metric_availability import (
-    build_metric_availability
-)
-
-from evaluation.engine.evaluator import (
-    run_evaluation
-)
-
-from evaluation.ragas.ragas_evaluator import (
-    run_ragas_evaluation
-)
-
-from evaluation.security.security_evaluator import (
-    evaluate_security,
-    summarize_security
-)
-
-from visualization.charts import (
-    create_metric_bar_chart,
-    create_sample_score_chart
-)
-
-from explainability.failure_analysis import (
-    analyze_failures,
-    summarize_failures
-)
-
-from explainability.root_cause import (
-    generate_root_cause_report
-)
-from evaluation.reliability.reliability_evaluator import (
-    evaluate_reliability,
-)
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="AITrustEval",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
+
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+from evaluation.dataset.data_loader import (
+    load_dataset,
+    get_dataset_info,
+)
+
+from evaluation.engine.evaluator import (
+    run_evaluation,
+)
+
+from evaluation.answer_quality.basic_metrics import (
+    evaluate_basic_answer_quality,
+)
+
+from explainability.explainability_engine import (
+    run_explainability,
+)
+
+# Baseline failure analysis is implemented locally in this dashboard
+# so it can safely consume the DataFrame produced by the baseline evaluator.
+
+from explainability.root_cause import (
+    generate_root_cause_report,
+)
+
+
+# ============================================================
+# REPORT GENERATOR
+# ============================================================
+
+REPORT_GENERATOR_PATH = (
+    PROJECT_ROOT
+    / "outputs"
+    / "reports"
+    / "report_generator.py"
+)
+
+
+_report_spec = (
+    importlib.util.spec_from_file_location(
+        "aitrust_eval_report_generator",
+        REPORT_GENERATOR_PATH,
+    )
+)
+
+
+_report_module = (
+    importlib.util.module_from_spec(
+        _report_spec
+    )
+)
+
+
+_report_spec.loader.exec_module(
+    _report_module
+)
+
+
+build_report_data = (
+    _report_module.build_report_data
+)
+
+generate_reports = (
+    _report_module.generate_reports
+)
+
+
+# ============================================================
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+
+    .main-title {
+        font-size: 42px;
+        font-weight: 800;
+        margin-bottom: 0;
+    }
+
+    .subtitle {
+        font-size: 18px;
+        color: #6b7280;
+        margin-bottom: 25px;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_value(
+    value,
+    default="Not Available",
+):
+    if value is None:
+        return default
+
+    try:
+
+        if pd.isna(value):
+            return default
+
+    except Exception:
+
+        pass
+
+    return value
+
+
+def format_sample_id(
+    value,
+):
+    try:
+
+        number = float(value)
+
+        if number.is_integer():
+
+            return str(
+                int(number)
+            )
+
+    except Exception:
+
+        pass
+
+    return str(value)
+
+
+def get_original_row(
+    df,
+    sample_id,
+):
+
+    try:
+
+        position = (
+            int(
+                float(
+                    sample_id
+                )
+            )
+            - 1
+        )
+
+        if (
+            0 <= position < len(df)
+        ):
+
+            return df.iloc[
+                position
+            ]
+
+    except Exception:
+
+        pass
+
+    return None
+
+
+def normalize_metric_name(
+    name,
+):
+
+    return (
+        str(name)
+        .replace(
+            "_",
+            " ",
+        )
+        .title()
+    )
+
+
+def _safe_numeric_score(value):
+    """
+    Convert a baseline metric value to a numeric score.
+
+    Non-numeric, missing, or invalid values are treated as unavailable.
+    """
+    try:
+        if value is None:
+            return None
+
+        numeric_value = float(value)
+
+        if pd.isna(numeric_value):
+            return None
+
+        return numeric_value
+
+    except Exception:
+        return None
+
+
+def build_baseline_failure_analysis(
+    results_df,
+    threshold=0.50,
+):
+    """
+    Build a normalized failure-analysis DataFrame directly from the
+    baseline sample-level results.
+
+    This avoids assumptions about nested dictionaries/lists inside the
+    baseline result rows and prevents errors such as:
+        'str' object has no attribute 'get'
+
+    Failure metrics:
+        - answer_relevancy
+        - answer_correctness
+        - context_answer_similarity
+
+    Severity:
+        1 failed metric -> Low
+        2 failed metrics -> Medium
+        3 failed metrics -> High
+    """
+
+    if results_df is None:
+        return pd.DataFrame()
+
+    if not isinstance(results_df, pd.DataFrame):
+        try:
+            results_df = pd.DataFrame(results_df)
+        except Exception:
+            return pd.DataFrame()
+
+    if results_df.empty:
+        return pd.DataFrame()
+
+    metric_columns = [
+        "answer_relevancy",
+        "answer_correctness",
+        "context_answer_similarity",
+    ]
+
+    available_metrics = [
+        metric
+        for metric in metric_columns
+        if metric in results_df.columns
+    ]
+
+    if not available_metrics:
+        return pd.DataFrame()
+
+    failure_rows = []
+
+    for position, (_, row) in enumerate(results_df.iterrows(), start=1):
+
+        sample_id = row.get(
+            "id",
+            position,
+        )
+
+        failed_metrics = []
+
+        metric_scores = {}
+
+        for metric in available_metrics:
+
+            score = _safe_numeric_score(
+                row.get(metric)
+            )
+
+            metric_scores[metric] = score
+
+            if (
+                score is not None
+                and score < threshold
+            ):
+                failed_metrics.append(metric)
+
+        if not failed_metrics:
+            continue
+
+        failure_count = len(
+            failed_metrics
+        )
+
+        if failure_count >= 3:
+            severity = "High"
+        elif failure_count == 2:
+            severity = "Medium"
+        else:
+            severity = "Low"
+
+        failure_rows.append(
+            {
+                "id": sample_id,
+                "severity": severity,
+                "failed_metrics": ", ".join(
+                    failed_metrics
+                ),
+                "failure_count": failure_count,
+                **metric_scores,
+            }
+        )
+
+    return pd.DataFrame(
+        failure_rows
+    )
+
+
+def summarize_baseline_failures(
+    failure_df,
+):
+    """
+    Summarize baseline failure counts by severity.
+    """
+
+    if failure_df is None:
+        return {
+            "total_failures": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+        }
+
+    if not isinstance(
+        failure_df,
+        pd.DataFrame,
+    ):
+        try:
+            failure_df = pd.DataFrame(
+                failure_df
+            )
+        except Exception:
+            return {
+                "total_failures": 0,
+                "high": 0,
+                "medium": 0,
+                "low": 0,
+            }
+
+    if failure_df.empty:
+        return {
+            "total_failures": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+        }
+
+    severity_series = (
+        failure_df.get(
+            "severity",
+            pd.Series(
+                dtype=str
+            ),
+        )
+        .astype(str)
+        .str.strip()
+        .str.title()
+    )
+
+    return {
+        "total_failures": int(
+            len(failure_df)
+        ),
+        "high": int(
+            (severity_series == "High").sum()
+        ),
+        "medium": int(
+            (severity_series == "Medium").sum()
+        ),
+        "low": int(
+            (severity_series == "Low").sum()
+        ),
+    }
+
+
+def parse_context(
+    value,
+):
+
+    if isinstance(
+        value,
+        list,
+    ):
+
+        return value
+
+    if isinstance(
+        value,
+        dict,
+    ):
+
+        return [
+            value
+        ]
+
+    text = safe_value(
+        value,
+        "",
+    )
+
+
+    try:
+
+        parsed = json.loads(
+            str(text)
+        )
+
+        if isinstance(
+            parsed,
+            list,
+        ):
+
+            return parsed
+
+        if isinstance(
+            parsed,
+            dict,
+        ):
+
+            return [
+                parsed
+            ]
+
+    except Exception:
+
+        pass
+
+
+    return [
+        {
+            "rank": 1,
+            "context": str(text),
+        }
+    ]
+
+
+def render_status(
+    title,
+    result,
+):
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+
+        st.info(
+            f"{title}: No result."
+        )
+
+        return
+
+
+    status = result.get(
+        "status",
+        "unknown",
+    )
+
+
+    message = result.get(
+        "message",
+        "",
+    )
+
+
+    if status in (
+        "completed",
+        "success",
+    ):
+
+        st.success(
+            f"**{title}: Completed**"
+        )
+
+
+    elif status == "unavailable":
+
+        st.warning(
+            f"**{title}: Unavailable**"
+        )
+
+
+    elif status == "error":
+
+        st.error(
+            f"**{title}: Error**"
+        )
+
+
+    else:
+
+        st.info(
+            f"**{title}: {status}**"
+        )
+
+
+    if message:
+
+        st.caption(
+            message
+        )
 
 
 # ============================================================
 # HEADER
 # ============================================================
 
-st.title("🛡️ AITrustEval")
+st.markdown(
+    '<div class="main-title">🛡️ AITrustEval</div>',
+    unsafe_allow_html=True,
+)
 
 st.markdown(
     """
-    **AI/ML Trustworthiness, Reliability and Security Evaluation Platform**
+    <div class="subtitle">
+    Offline AI/ML Trustworthiness, Security & Reliability
+    Evaluation Platform
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    Upload an evaluation dataset to analyze AI system performance,
-    identify failures, investigate possible root causes, evaluate
-    security risks, and generate evaluation results.
+st.markdown(
+    """
+    **Retrieval Quality • RAG/LLM Quality • Security • Reliability •
+    Explainability • Failures • Root Causes**
     """
 )
+
 
 st.divider()
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# SIDEBAR
 # ============================================================
 
-def format_sample_id(value):
-    """
-    Display numeric IDs as integers instead of 1.0, 2.0, etc.
-    """
+with st.sidebar:
 
-    try:
-        numeric_value = float(value)
+    st.header(
+        "🛡️ AITrustEval"
+    )
 
-        if numeric_value.is_integer():
-            return str(int(numeric_value))
+    st.markdown(
+        """
+        ### Evaluation Layers
 
-    except Exception:
-        pass
+        🔎 Retrieval
 
-    return str(value)
+        📊 Baseline Answer Quality
 
+        🧠 RAG / LLM
 
-def get_original_row(df, sample_id):
-    """
-    Retrieve the original dataset row using the sequential
-    sample ID generated by the evaluation engine.
-    """
+        🛡️ Security
 
-    try:
-        position = int(float(sample_id)) - 1
+        ⚙️ Reliability
 
-        if 0 <= position < len(df):
-            return df.iloc[position]
+        🧩 Explainability
 
-    except Exception:
-        pass
+        🚨 Failure Analysis
 
-    return None
+        🧬 Root Cause
 
-
-# ============================================================
-# DATASET UPLOAD
-# ============================================================
-
-st.header("📂 Upload Evaluation Dataset")
-
-if "uploaded_file_name" not in st.session_state:
-    st.session_state.uploaded_file_name = None
-
-uploaded_file = st.file_uploader(
-    "Upload CSV, Excel or JSON dataset",
-    type=["csv", "xlsx", "xls", "json"]
-)
-
-if uploaded_file is not None:
-    st.session_state.uploaded_file_name = uploaded_file.name
-
-
-if (
-    uploaded_file is None
-    and not st.session_state.analysis_completed
-):
-
-    st.info(
-        "👆 Upload an evaluation dataset to begin."
+        📄 Reporting
+        """
     )
 
     st.divider()
 
     st.caption(
-        "AITrustEval — Offline AI/ML Trustworthiness Evaluation Platform"
+        "Development: Windows"
+    )
+
+    st.caption(
+        "Deployment: Offline Ubuntu / DRDO"
+    )
+
+
+# ============================================================
+# UPLOAD
+# ============================================================
+
+st.header(
+    "📂 Upload Evaluation Dataset"
+)
+
+
+uploaded_file = st.file_uploader(
+    "Upload CSV, Excel or JSON dataset",
+    type=[
+        "csv",
+        "xlsx",
+        "xls",
+        "json",
+        "jsonl",
+    ],
+)
+
+
+if uploaded_file is None:
+
+    st.info(
+        "👆 Upload an evaluation dataset to begin."
     )
 
     st.stop()
 
+
 # ============================================================
-# SAVE UPLOADED DATASET
+# SAVE DATASET
 # ============================================================
+
+input_directory = (
+    PROJECT_ROOT
+    / "data"
+    / "input"
+)
+
+
+input_directory.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
 
 file_extension = (
     uploaded_file.name
@@ -178,174 +673,514 @@ file_extension = (
     .lower()
 )
 
+
 input_path = (
-    f"data/input/uploaded_dataset.{file_extension}"
+    input_directory
+    / f"uploaded_dataset.{file_extension}"
 )
 
 
 try:
 
-    with open(input_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+    with open(
+        input_path,
+        "wb",
+    ) as file:
 
-except Exception as e:
+        file.write(
+            uploaded_file.getbuffer()
+        )
+
+except Exception as error:
 
     st.error(
-        f"Unable to save uploaded dataset: {e}"
+        f"Unable to save dataset: {error}"
     )
 
     st.stop()
 
 
 # ============================================================
-# LOAD DATASET
+# LOAD
 # ============================================================
 
 try:
 
     df = load_dataset(
-        input_path
+        str(input_path)
     )
 
-except Exception as e:
+except Exception as error:
 
     st.error(
-        f"Unable to load dataset: {e}"
+        f"Unable to load dataset: {error}"
     )
 
     st.stop()
 
 
 # ============================================================
-# DATASET INFORMATION
+# DATASET OVERVIEW
 # ============================================================
 
 st.divider()
 
-st.header("📊 Dataset Information")
+st.header(
+    "📊 Dataset Overview"
+)
 
 
-dataset_info = get_dataset_info(df)
+dataset_info = get_dataset_info(
+    df
+)
 
 
-col1, col2, col3, col4 = st.columns(4)
+columns = st.columns(
+    5
+)
 
 
-with col1:
+with columns[0]:
+
     st.metric(
         "Rows",
-        dataset_info["rows"]
+        dataset_info.get(
+            "rows",
+            len(df),
+        ),
     )
 
 
-with col2:
+with columns[1]:
+
     st.metric(
         "Columns",
-        dataset_info["columns"]
+        dataset_info.get(
+            "columns",
+            len(df.columns),
+        ),
     )
 
 
-with col3:
+with columns[2]:
+
     st.metric(
         "Missing Values",
-        dataset_info["missing_values"]
+        dataset_info.get(
+            "missing_values",
+            int(
+                df.isna()
+                .sum()
+                .sum()
+            ),
+        ),
     )
 
 
-with col4:
+with columns[3]:
+
     st.metric(
         "Duplicate Rows",
-        dataset_info["duplicate_rows"]
+        dataset_info.get(
+            "duplicate_rows",
+            int(
+                df.duplicated()
+                .sum()
+            ),
+        ),
     )
 
 
-# ============================================================
-# DATASET PREVIEW
-# ============================================================
+with columns[4]:
 
-st.subheader("Dataset Preview")
+    st.metric(
+        "File Type",
+        file_extension.upper(),
+    )
 
-st.dataframe(
-    df.head(10),
-    use_container_width=True
+
+st.caption(
+    f"Dataset: `{uploaded_file.name}`"
 )
 
 
+with st.expander(
+    "👁️ Preview Dataset"
+):
+
+    st.table(df.head(10))
+
+
 # ============================================================
-# SCHEMA DETECTION
+# ANALYZE
 # ============================================================
 
 st.divider()
 
-st.header("🔍 Dataset Schema Detection")
+
+if "analysis_requested" not in st.session_state:
+    st.session_state["analysis_requested"] = False
 
 
-validation_result = validate_dataset(df)
-
-
-detected_columns = validation_result.get(
-    "detected_columns",
-    {}
+analyze_button = st.button(
+    "🚀 Analyze Dataset",
+    type="primary",
+    use_container_width=True,
 )
 
 
-if detected_columns:
+if analyze_button:
+    st.session_state["analysis_requested"] = True
 
-    st.subheader(
-        "Detected Column Mapping"
+
+if not st.session_state["analysis_requested"]:
+
+    st.info(
+        "Click **Analyze Dataset** to run the complete evaluation pipeline."
     )
 
-    mapping_data = []
+    st.stop()
 
-    for field, column in detected_columns.items():
 
-        mapping_data.append(
-            {
-                "AITrustEval Field": field,
-                "Dataset Column": column
-            }
+# ============================================================
+# CENTRAL EVALUATION
+# ============================================================
+
+with st.spinner(
+    "Running AITrustEval evaluation..."
+):
+
+    evaluation = run_evaluation(
+        df
+    )
+
+
+schema = evaluation.get(
+    "schema",
+    {},
+)
+
+
+# ============================================================
+# BASELINE ANSWER QUALITY
+# ============================================================
+
+with st.spinner(
+    "Running offline baseline answer-quality evaluation..."
+):
+
+    baseline = (
+        evaluate_basic_answer_quality(
+            df,
+            schema,
+        )
+    )
+
+
+# Add baseline information to
+# centralized evaluation result.
+
+evaluation[
+    "baseline_answer_quality"
+] = baseline
+
+
+evaluation[
+    "metrics"
+] = evaluation.get(
+    "metrics",
+    {},
+)
+
+
+evaluation[
+    "metrics"
+][
+    "baseline_answer_quality"
+] = baseline.get(
+    "averages",
+    {},
+)
+
+
+# Update metric availability.
+
+metric_availability = evaluation.get(
+    "metric_availability",
+    {},
+)
+
+
+baseline_available = (
+    baseline.get(
+        "status"
+    )
+    == "completed"
+)
+
+
+metric_availability[
+    "baseline_answer_quality"
+] = (
+    baseline_available
+)
+
+
+evaluation[
+    "metric_availability"
+] = metric_availability
+
+
+# ============================================================
+# BASELINE DATAFRAME
+# ============================================================
+
+baseline_results = pd.DataFrame(
+    baseline.get(
+        "sample_results",
+        [],
+    )
+)
+
+
+# ============================================================
+# FAILURE ANALYSIS
+# ============================================================
+
+failure_df = pd.DataFrame()
+
+
+failure_summary = {}
+
+root_cause_df = pd.DataFrame()
+
+
+recommendations = []
+
+
+if not baseline_results.empty:
+
+    try:
+
+        failure_df = build_baseline_failure_analysis(
+            baseline_results
         )
 
-    mapping_df = pd.DataFrame(
-        mapping_data
+
+        failure_summary = (
+            summarize_baseline_failures(
+                failure_df
+            )
+        )
+
+
+        root_cause_df = (
+            generate_root_cause_report(
+                failure_df
+            )
+        )
+
+
+        if not root_cause_df.empty:
+
+            recommendations = (
+                root_cause_df[
+                    "recommendation"
+                ]
+                .dropna()
+                .astype(str)
+                .drop_duplicates()
+                .tolist()
+            )
+
+
+    except Exception as error:
+
+        st.warning(
+            f"Baseline failure analysis could not be completed: {error}"
+        )
+
+
+# ============================================================
+# EXPLAINABILITY
+# ============================================================
+
+with st.spinner(
+    "Running explainability and evidence analysis..."
+):
+
+    explainability = (
+        run_explainability(
+            df,
+            evaluation_result=evaluation,
+        )
     )
 
-    st.dataframe(
-        mapping_df,
-        use_container_width=True,
-        hide_index=True
+
+# ============================================================
+# EVALUATION STATUS
+# ============================================================
+
+st.divider()
+
+st.header(
+    "📌 Evaluation Status"
+)
+
+
+st.success(
+    "Evaluation pipeline completed."
+)
+
+
+status_columns = st.columns(
+    6
+)
+
+
+with status_columns[0]:
+
+    render_status(
+        "🔎 Retrieval",
+        evaluation.get(
+            "retrieval",
+            {},
+        ),
+    )
+
+
+with status_columns[1]:
+
+    render_status(
+        "📊 Baseline",
+        baseline,
+    )
+
+
+with status_columns[2]:
+
+    render_status(
+        "🧠 RAGAS",
+        evaluation.get(
+            "ragas",
+            {},
+        ),
+    )
+
+
+with status_columns[3]:
+
+    render_status(
+        "🛡️ Security",
+        evaluation.get(
+            "security",
+            {},
+        ),
+    )
+
+
+with status_columns[4]:
+
+    render_status(
+        "⚙️ Reliability",
+        evaluation.get(
+            "reliability",
+            {},
+        ),
+    )
+
+
+with status_columns[5]:
+
+    render_status(
+        "🧩 Explainability",
+        explainability,
+    )
+
+
+# ============================================================
+# SCHEMA
+# ============================================================
+
+st.divider()
+
+st.header(
+    "🔍 Schema Detection"
+)
+
+
+schema_rows = []
+
+
+for field, column in (
+    schema.items()
+):
+
+    schema_rows.append(
+        {
+            "AITrustEval Field":
+                field,
+
+            "Detected Dataset Column":
+                (
+                    column
+                    if column
+                    else "NOT DETECTED"
+                ),
+        }
+    )
+
+
+if schema_rows:
+
+    st.table(pd.DataFrame(schema_rows))
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+validation = evaluation.get(
+    "validation",
+    {},
+)
+
+
+st.subheader(
+    "Dataset Validation"
+)
+
+
+if validation.get(
+    "valid",
+    False,
+):
+
+    st.success(
+        validation.get(
+            "message",
+            "Dataset validation completed.",
+        )
     )
 
 else:
 
     st.warning(
-        "No compatible columns were automatically detected."
+        validation.get(
+            "message",
+            "Dataset validation did not pass.",
+        )
     )
 
 
-# ============================================================
-# COLUMN VARIABLES
-# ============================================================
+for warning in validation.get(
+    "warnings",
+    [],
+):
 
-question_column = detected_columns.get(
-    "question"
-)
-
-answer_column = detected_columns.get(
-    "answer"
-)
-
-ground_truth_column = detected_columns.get(
-    "ground_truth"
-)
-
-context_column = detected_columns.get(
-    "context"
-)
-
-latency_column = detected_columns.get(
-    "latency"
-)
+    st.warning(
+        warning
+    )
 
 
 # ============================================================
@@ -354,2255 +1189,1763 @@ latency_column = detected_columns.get(
 
 st.divider()
 
-st.header("📋 Metric Availability")
-
-
-availability = build_metric_availability(
-    validation_result
+st.header(
+    "📋 Metric Availability"
 )
 
 
-# ============================================================
-# BASELINE METRICS
-# ============================================================
-
-st.subheader(
-    "Baseline Metrics"
-)
-
-st.caption(
-    "These metrics use the current lightweight baseline "
-    "evaluation implementation."
+availability = evaluation.get(
+    "metric_availability",
+    {},
 )
 
 
-baseline_status = {
-    "Answer Relevancy": (
-        question_column is not None
-        and answer_column is not None
-    ),
-
-    "Answer Correctness": (
-        answer_column is not None
-        and ground_truth_column is not None
-    ),
-
-    "Context-Answer Similarity": (
-        answer_column is not None
-        and context_column is not None
-    )
-}
+availability_rows = []
 
 
-for metric, available in baseline_status.items():
+for metric, value in (
+    availability.items()
+):
 
-    if available:
+    availability_rows.append(
+        {
+            "Metric":
+                normalize_metric_name(
+                    metric
+                ),
 
-        st.success(
-            f"✅ {metric} — Available"
-        )
-
-    else:
-
-        st.warning(
-            f"⚠️ {metric} — Not Available"
-        )
-
-
-# ============================================================
-# RAGAS / LLM METRICS
-# ============================================================
-
-st.subheader(
-    "Ragas / LLM Metrics"
-)
-
-st.caption(
-    "These metrics require the required dataset fields and "
-    "the approved local LLM environment."
-)
-
-
-ragas_input_ready = all(
-    [
-        question_column is not None,
-        answer_column is not None,
-        ground_truth_column is not None,
-        context_column is not None
-    ]
-)
-
-
-ragas_metrics = [
-    "Faithfulness",
-    "Answer Relevancy",
-    "Answer Correctness",
-    "Context Precision",
-    "Context Recall"
-]
-
-
-for metric in ragas_metrics:
-
-    if ragas_input_ready:
-
-        st.info(
-            f"🧠 {metric} — "
-            "Input fields available; local Mistral/Ollama required"
-        )
-
-    else:
-
-        st.warning(
-            f"⚠️ {metric} — Required input fields unavailable"
-        )
-
-
-# ============================================================
-# RETRIEVAL METRICS
-# ============================================================
-
-st.subheader(
-    "Retrieval Metrics"
-)
-
-
-retrieval_metrics = [
-    "Precision@K",
-    "Recall@K",
-    "MRR",
-    "NDCG",
-    "Hit Rate"
-]
-
-
-for metric in retrieval_metrics:
-
-    key = (
-        metric.lower()
-        .replace("@", "_at_")
-        .replace(" ", "_")
-    )
-
-    status = availability.get(
-        key,
-        False
-    )
-
-    if status:
-
-        st.success(
-            f"✅ {metric} — Available"
-        )
-
-    else:
-
-        st.warning(
-            f"⚠️ {metric} — Not Available"
-        )
-
-
-# ============================================================
-# PERFORMANCE
-# ============================================================
-
-st.subheader(
-    "Performance"
-)
-
-
-if latency_column:
-
-    st.success(
-        f"✅ Latency — Available "
-        f"({latency_column})"
-    )
-
-else:
-
-    st.warning(
-        "⚠️ Latency — Not Available"
+            "Status":
+                (
+                    "✅ Available"
+                    if bool(value)
+                    else "❌ Not Available"
+                ),
+        }
     )
 
 
-# ============================================================
-# WARNINGS
-# ============================================================
+if availability_rows:
 
-warnings = validation_result.get(
-    "warnings",
-    []
-)
-
-
-if warnings:
-
-    st.subheader(
-        "⚠️ Dataset Warnings"
-    )
-
-    for warning in warnings:
-
-        st.warning(
-            warning
-        )
+    st.table(pd.DataFrame(availability_rows))
 
 
 # ============================================================
-# ANALYZE BUTTON
+# BASELINE ANSWER QUALITY
 # ============================================================
 
 st.divider()
 
-analyze_button = st.button(
-    "🚀 Analyze Dataset",
-    type="primary",
-    use_container_width=True
+st.header(
+    "📊 Baseline Answer-Quality Evaluation"
 )
 
 
-# Continue if Analyze was clicked OR
-# analysis was already completed earlier.
-if not analyze_button and not st.session_state.analysis_completed:
-    st.stop()
+st.caption(
+    """
+    These are lightweight offline lexical/reference-similarity
+    measurements. They are useful for baseline analysis but are
+    not equivalent to RAGAS or LLM-as-a-judge evaluation.
+    """
+)
 
-# ============================================================
-# BASELINE EVALUATION
-# ============================================================
 
-with st.spinner(
-    "Running baseline evaluation..."
-):
+baseline_averages = baseline.get(
+    "averages",
+    {},
+)
 
-    try:
 
-        evaluation = run_evaluation(
-            df
+if baseline_averages:
+
+    baseline_columns = st.columns(
+        len(
+            baseline_averages
         )
-
-    except Exception as e:
-
-        st.error(
-            f"Baseline evaluation failed: {e}"
-        )
-
-        st.stop()
-
-
-st.success(
-    "Baseline evaluation completed."
-)
-
-
-results_df = evaluation.get(
-    "sample_results",
-    pd.DataFrame()
-)
-
-
-# ============================================================
-# SAVE BASELINE RESULTS TO SESSION STATE
-# ============================================================
-
-st.session_state.evaluation = evaluation
-
-st.session_state.results_df = results_df
-
-st.session_state.analysis_completed = True
-
-
-# ============================================================
-# BASELINE RESULTS
-# ============================================================
-
-if not results_df.empty:
-
-    st.divider()
-
-    st.header(
-        "📈 Baseline Evaluation Results"
     )
 
 
-    metric_columns = [
-        "answer_relevancy",
-        "answer_correctness",
-        "context_answer_similarity"
-    ]
+    for index, (
+        metric,
+        value,
+    ) in enumerate(
+        baseline_averages.items()
+    ):
 
+        with baseline_columns[
+            index
+        ]:
 
-    available_metric_columns = [
-        metric
-        for metric in metric_columns
-        if metric in results_df.columns
-    ]
-
-
-    averages = {}
-
-
-    for metric in available_metric_columns:
-
-        averages[metric] = (
-            pd.to_numeric(
-                results_df[metric],
-                errors="coerce"
+            st.metric(
+                normalize_metric_name(
+                    metric
+                ),
+                f"{float(value):.4f}",
             )
-            .mean()
-        )
 
 
-    # ========================================================
-    # KPI CARDS
-    # ========================================================
+    chart_df = pd.DataFrame(
+        [
+            {
+                "Metric":
+                    normalize_metric_name(
+                        metric
+                    ),
 
-    if averages:
+                "Score":
+                    float(value),
+            }
 
-        kpi_columns = st.columns(
-            len(averages)
-        )
-
-
-        for index, (
-            metric,
-            value
-        ) in enumerate(
-            averages.items()
-        ):
-
-            with kpi_columns[index]:
-
-                st.metric(
-                    metric.replace(
-                        "_",
-                        " "
-                    ).title(),
-                    f"{value:.3f}"
-                )
+            for metric, value
+            in baseline_averages.items()
+        ]
+    )
 
 
-    # ========================================================
-    # BASELINE CHART
-    # ========================================================
-
-    if averages:
-
-        st.subheader(
-            "Average Evaluation Scores"
-        )
+    chart = px.bar(
+        chart_df,
+        x="Metric",
+        y="Score",
+        title="Average Baseline Evaluation Scores",
+        text="Score",
+    )
 
 
-        fig = create_metric_bar_chart(
-            averages
-        )
+    chart.update_yaxes(
+        range=[
+            0,
+            1,
+        ]
+    )
 
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+    chart.update_traces(
+        texttemplate="%{text:.3f}",
+        textposition="outside",
+    )
 
 
-    # ========================================================
-    # SAMPLE SCORE CHART
-    # ========================================================
+    st.plotly_chart(
+        chart,
+        use_container_width=True,
+    )
+
 
     st.subheader(
         "Evaluation Scores by Sample"
     )
 
 
-    try:
+    score_columns = [
+        "answer_relevancy",
+        "answer_correctness",
+        "context_answer_similarity",
+    ]
 
-        fig = create_sample_score_chart(
-            results_df
+
+    existing_score_columns = [
+        column
+        for column in score_columns
+        if column in baseline_results.columns
+    ]
+
+
+    if existing_score_columns:
+
+        plot_df = baseline_results[
+            [
+                "id"
+            ]
+            + existing_score_columns
+        ].copy()
+
+
+        plot_df = plot_df.rename(
+            columns={
+                column:
+                    normalize_metric_name(
+                        column
+                    )
+
+                for column
+                in existing_score_columns
+            }
         )
+
+
+        plot_df = plot_df.melt(
+            id_vars=[
+                "id"
+            ],
+            var_name="Metric",
+            value_name="Score",
+        )
+
+
+        sample_chart = px.line(
+            plot_df,
+            x="id",
+            y="Score",
+            color="Metric",
+            markers=True,
+            title="Baseline Scores by Sample",
+        )
+
+
+        sample_chart.update_yaxes(
+            range=[
+                0,
+                1,
+            ]
+        )
+
 
         st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    except Exception as e:
-
-        st.warning(
-            f"Unable to generate sample score chart: {e}"
+            sample_chart,
+            use_container_width=True,
         )
 
 
-    # ========================================================
-    # RESULTS TABLE
-    # ========================================================
+    with st.expander(
+        "📄 View Sample-Level Baseline Results"
+    ):
 
-    st.subheader(
-        "Sample-Level Baseline Results"
-    )
+        st.table(baseline_results)
 
 
-    st.dataframe(
-        results_df,
-        use_container_width=True
-    )
-
-
-    # ========================================================
-    # DOWNLOAD
-    # ========================================================
-
-    csv_data = (
-        results_df
-        .to_csv(index=False)
-        .encode("utf-8")
+    baseline_csv = (
+        baseline_results
+        .to_csv(
+            index=False
+        )
+        .encode(
+            "utf-8"
+        )
     )
 
 
     st.download_button(
         label="⬇️ Download Baseline Results",
-        data=csv_data,
+        data=baseline_csv,
         file_name="baseline_evaluation_results.csv",
-        mime="text/csv"
+        mime="text/csv",
     )
 
-
-# ============================================================
-# RAGAS + MISTRAL
-# ============================================================
-
-st.divider()
-
-st.header(
-    "🧠 Ragas LLM Evaluation"
-)
-
-st.markdown(
-    """
-    Ragas provides LLM-based evaluation of answer and RAG
-    quality. In the DRDO environment, the evaluator is
-    intended to use the approved local **Mistral model
-    through Ollama**.
-    """
-)
-
-
-with st.spinner(
-    "Checking local Ragas environment..."
-):
-
-    try:
-
-        ragas_evaluation = run_ragas_evaluation(
-            df
-        )
-
-    except Exception as e:
-
-        ragas_evaluation = {
-            "status": "error",
-            "message": str(e)
-        }
-
-
-# ============================================================
-# SAVE RAGAS RESULT TO SESSION STATE
-# ============================================================
-
-st.session_state.ragas_results = (
-    ragas_evaluation.get(
-        "results",
-        pd.DataFrame()
-    )
-)
-
-
-ragas_status = ragas_evaluation.get(
-    "status"
-)
-
-
-if ragas_status == "unavailable":
-
-    st.warning(
-        "⚠️ Ragas + Ollama/Mistral is currently unavailable."
-    )
-
-    st.info(
-        """
-        This is expected on the current Windows
-        development machine because Ollama is not
-        installed.
-
-        The same application can use the approved
-        local Ollama + Mistral environment in DRDO.
-        """
-    )
-
-
-elif ragas_status == "error":
-
-    st.error(
-        "Ragas evaluation could not be completed."
-    )
-
-    st.error(
-        ragas_evaluation.get(
-            "message",
-            "Unknown error."
-        )
-    )
-
-
-elif ragas_status == "success":
-
-    st.success(
-        "✅ Ragas evaluation completed successfully."
-    )
-
-
-    st.write(
-        f"**Evaluation Model:** "
-        f"{ragas_evaluation.get('model', 'mistral')}"
-    )
-
-
-    ragas_mapping = ragas_evaluation.get(
-        "mapping",
-        {}
-    )
-
-
-    if ragas_mapping:
-
-        st.subheader(
-            "Ragas Column Mapping"
-        )
-
-
-        ragas_mapping_df = pd.DataFrame(
-            [
-                {
-                    "Ragas Field": field,
-                    "Dataset Column": column
-                }
-
-                for field, column
-                in ragas_mapping.items()
-            ]
-        )
-
-
-        st.dataframe(
-            ragas_mapping_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-    ragas_results = ragas_evaluation.get(
-        "results",
-        pd.DataFrame()
-    )
-
-
-    # Keep the latest Ragas results in session state
-    st.session_state.ragas_results = ragas_results
-
-
-    if not ragas_results.empty:
-
-        st.subheader(
-            "Ragas Metric Results"
-        )
-
-
-        st.dataframe(
-            ragas_results,
-            use_container_width=True
-        )
-
-
-        ragas_metric_names = [
-            "faithfulness",
-            "answer_relevancy",
-            "answer_correctness",
-            "context_precision",
-            "context_recall"
-        ]
-
-
-        ragas_averages = {}
-
-
-        for metric in ragas_metric_names:
-
-            if metric in ragas_results.columns:
-
-                numeric_values = pd.to_numeric(
-                    ragas_results[metric],
-                    errors="coerce"
-                )
-
-
-                if numeric_values.notna().any():
-
-                    ragas_averages[metric] = (
-                        numeric_values.mean()
-                    )
-
-
-        if ragas_averages:
-
-            st.subheader(
-                "Average Ragas Scores"
-            )
-
-
-            ragas_kpis = st.columns(
-                len(ragas_averages)
-            )
-
-
-            for index, (
-                metric,
-                value
-            ) in enumerate(
-                ragas_averages.items()
-            ):
-
-                with ragas_kpis[index]:
-
-                    st.metric(
-                        metric.replace(
-                            "_",
-                            " "
-                        ).title(),
-                        f"{value:.3f}"
-                    )
-
-
-            ragas_chart = (
-                create_metric_bar_chart(
-                    ragas_averages
-                )
-            )
-
-
-            st.plotly_chart(
-                ragas_chart,
-                use_container_width=True
-            )
-
-
-            ragas_csv = (
-                ragas_results
-                .to_csv(index=False)
-                .encode("utf-8")
-            )
-
-
-            st.download_button(
-                label="⬇️ Download Ragas Results",
-                data=ragas_csv,
-                file_name="ragas_evaluation_results.csv",
-                mime="text/csv"
-            )
-
-
-# ============================================================
-# FAILURE INVESTIGATION
-# ============================================================
-
-if not results_df.empty:
-
-    st.divider()
-
-    st.header(
-        "🔎 Failure Investigation"
-    )
-
-
-    st.markdown(
-        """
-        This section identifies samples with low baseline
-        evaluation scores and provides a preliminary
-        root-cause investigation.
-
-        **Note:** Current thresholds are preliminary
-        investigation thresholds and are not official
-        pass/fail standards.
-        """
-    )
-
-
-    try:
-
-        failures_df = analyze_failures(
-            results_df
-        )
-
-        failure_summary = summarize_failures(
-            failures_df
-        )
-
-        root_cause_df = generate_root_cause_report(
-            failures_df
-        )
-        st.session_state.failure_summary = failure_summary
-        st.session_state.root_cause_df = root_cause_df
-
-    except Exception as e:
-
-        st.error(
-            f"Failure analysis failed: {e}"
-        )
-
-        root_cause_df = pd.DataFrame()
-
-
-    if not root_cause_df.empty:
-
-        st.subheader(
-            "Failure Summary"
-        )
-
-
-        col1, col2, col3, col4 = st.columns(4)
-
-
-        with col1:
-
-            st.metric(
-                "Total Failures",
-                failure_summary.get(
-                    "total_failures",
-                    0
-                )
-            )
-
-
-        with col2:
-
-            st.metric(
-                "High Severity",
-                failure_summary.get(
-                    "high",
-                    0
-                )
-            )
-
-
-        with col3:
-
-            st.metric(
-                "Medium Severity",
-                failure_summary.get(
-                    "medium",
-                    0
-                )
-            )
-
-
-        with col4:
-
-            st.metric(
-                "Low Severity",
-                failure_summary.get(
-                    "low",
-                    0
-                )
-            )
-
-
-        st.subheader(
-            "Failed Samples"
-        )
-
-
-        display_columns = [
-            "id",
-            "severity",
-            "failed_metrics"
-        ]
-
-
-        available_columns = [
-            column
-            for column in display_columns
-            if column in root_cause_df.columns
-        ]
-
-
-        st.dataframe(
-            root_cause_df[
-                available_columns
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-        st.subheader(
-            "🧪 Sample-Level Investigation"
-        )
-
-
-        failure_ids = (
-            root_cause_df["id"]
-            .tolist()
-        )
-
-
-        selected_id = st.selectbox(
-            "Select a failed sample",
-            failure_ids,
-            format_func=format_sample_id,
-            key="failure_sample"
-        )
-
-
-        selected_failure = root_cause_df[
-            root_cause_df["id"] == selected_id
-        ].iloc[0]
-
-
-        selected_results = results_df[
-            results_df["id"] == selected_id
-        ]
-
-
-        if not selected_results.empty:
-
-            selected_result = (
-                selected_results.iloc[0]
-            )
-
-
-            st.markdown(
-                "### 📊 Evaluation Scores"
-            )
-
-
-            score_columns = [
-                "answer_relevancy",
-                "answer_correctness",
-                "context_answer_similarity"
-            ]
-
-
-            available_scores = [
-                metric
-                for metric in score_columns
-                if metric in selected_result.index
-            ]
-
-
-            if available_scores:
-
-                score_cols = st.columns(
-                    len(available_scores)
-                )
-
-
-                for index, metric in enumerate(
-                    available_scores
-                ):
-
-                    with score_cols[index]:
-
-                        st.metric(
-                            metric.replace(
-                                "_",
-                                " "
-                            ).title(),
-                            f"{float(selected_result[metric]):.3f}"
-                        )
-
-
-            severity = selected_failure.get(
-                "severity",
-                "Unknown"
-            )
-
-
-            st.markdown(
-                "### 🚨 Severity"
-            )
-
-
-            if severity == "High":
-
-                st.error(
-                    f"High Severity — Sample "
-                    f"{format_sample_id(selected_id)}"
-                )
-
-            elif severity == "Medium":
-
-                st.warning(
-                    f"Medium Severity — Sample "
-                    f"{format_sample_id(selected_id)}"
-                )
-
-            else:
-
-                st.info(
-                    f"Low Severity — Sample "
-                    f"{format_sample_id(selected_id)}"
-                )
-
-
-            st.markdown(
-                "### ❌ Failed Metrics"
-            )
-
-
-            st.write(
-                selected_failure.get(
-                    "failed_metrics",
-                    "Not available"
-                )
-            )
-
-
-            st.markdown(
-                "### 🔍 Preliminary Root Cause"
-            )
-
-
-            st.warning(
-                selected_failure.get(
-                    "root_cause",
-                    "Root cause not available."
-                )
-            )
-
-
-            st.markdown(
-                "### 💡 Recommendation"
-            )
-
-
-            st.info(
-                selected_failure.get(
-                    "recommendation",
-                    "No recommendation available."
-                )
-            )
-
-
-            original_row = get_original_row(
-                df,
-                selected_id
-            )
-
-
-            if original_row is not None:
-
-                st.markdown(
-                    "### 📚 Evidence"
-                )
-
-
-                with st.expander(
-                    "❓ View Question"
-                ):
-
-                    if question_column:
-
-                        st.write(
-                            original_row.get(
-                                question_column,
-                                "Not available"
-                            )
-                        )
-
-                    else:
-
-                        st.write(
-                            "Not available"
-                        )
-
-
-                with st.expander(
-                    "🤖 View Generated Answer"
-                ):
-
-                    if answer_column:
-
-                        st.write(
-                            original_row.get(
-                                answer_column,
-                                "Not available"
-                            )
-                        )
-
-                    else:
-
-                        st.write(
-                            "Not available"
-                        )
-
-
-                with st.expander(
-                    "🎯 View Ground Truth"
-                ):
-
-                    if ground_truth_column:
-
-                        st.write(
-                            original_row.get(
-                                ground_truth_column,
-                                "Not available"
-                            )
-                        )
-
-                    else:
-
-                        st.write(
-                            "Not available"
-                        )
-
-
-                with st.expander(
-                    "📄 View Retrieved Context"
-                ):
-
-                    if context_column:
-
-                        st.write(
-                            original_row.get(
-                                context_column,
-                                "Not available"
-                            )
-                        )
-
-                    else:
-
-                        st.write(
-                            "Not available"
-                        )
-
-
-# ============================================================
-# SECURITY EVALUATION
-# ============================================================
-
-st.divider()
-
-st.header(
-    "🛡️ Security Evaluation"
-)
-
-
-st.markdown(
-    """
-    AITrustEval performs two levels of security evaluation:
-
-    **1. Rule-Based Security Screening**
-    - Prompt Injection
-    - Jailbreak
-    - Toxicity
-    - Data Leakage
-
-    **2. Local Mistral Semantic Evaluation**
-    - Semantic interpretation of potential attacks
-    - Security reasoning
-    - Evidence
-    - Recommendations
-
-    The final result combines both evaluations when
-    Mistral is available.
-    """
-)
-
-
-if (
-    question_column
-    and answer_column
-):
-
-    try:
-
-        with st.spinner(
-            "Running security evaluation..."
-        ):
-
-            security_results = evaluate_security(
-                df,
-                question_column=question_column,
-                answer_column=answer_column,
-                use_mistral=True,
-                model="mistral"
-            )
-
-
-        security_summary = summarize_security(
-            security_results
-        )
-        st.session_state.security_results = security_results
-        st.session_state.security_summary = security_summary
-
-
-        # ====================================================
-        # MISTRAL STATUS
-        # ====================================================
-
-        if "mistral_status" in security_results.columns:
-
-            mistral_statuses = (
-                security_results[
-                    "mistral_status"
-                ]
-                .astype(str)
-                .str.lower()
-                .unique()
-            )
-
-
-            if "success" in mistral_statuses:
-
-                st.success(
-                    "🧠 Local Mistral semantic security "
-                    "evaluation is active."
-                )
-
-            elif "unavailable" in mistral_statuses:
-
-                st.warning(
-                    "⚠️ Local Mistral semantic evaluation "
-                    "is unavailable. Combined results are "
-                    "currently based on rule-based screening."
-                )
-
-                st.info(
-                    """
-                    This is expected on the current Windows
-                    development machine if Ollama/Mistral is
-                    not installed.
-
-                    In the DRDO environment, the local Mistral
-                    evaluator can provide semantic security
-                    analysis.
-                    """
-                )
-
-            else:
-
-                st.warning(
-                    "⚠️ Mistral semantic evaluation "
-                    "was not completed."
-                )
-
-
-        # ====================================================
-        # SECURITY SUMMARY
-        # ====================================================
-
-        st.subheader(
-            "Security Summary"
-        )
-
-
-        col1, col2, col3, col4 = st.columns(4)
-
-
-        with col1:
-
-            st.metric(
-                "Total Samples",
-                security_summary[
-                    "total_samples"
-                ]
-            )
-
-
-        with col2:
-
-            st.metric(
-                "High Risk",
-                security_summary[
-                    "high_risk"
-                ]
-            )
-
-
-        with col3:
-
-            st.metric(
-                "Medium Risk",
-                security_summary[
-                    "medium_risk"
-                ]
-            )
-
-
-        with col4:
-
-            st.metric(
-                "Low Risk",
-                security_summary[
-                    "low_risk"
-                ]
-            )
-
-
-        # ====================================================
-        # SECURITY CHECK RESULTS
-        # ====================================================
-
-        st.subheader(
-            "Security Check Results"
-        )
-
-
-        col1, col2, col3, col4 = st.columns(4)
-
-
-        security_counts = [
-            (
-                "Prompt Injection",
-                "prompt_injection"
-            ),
-            (
-                "Jailbreak",
-                "jailbreak"
-            ),
-            (
-                "Toxicity",
-                "toxicity"
-            ),
-            (
-                "Data Leakage",
-                "data_leakage"
-            )
-        ]
-
-
-        for column, (
-            label,
-            category
-        ) in zip(
-            [col1, col2, col3, col4],
-            security_counts
-        ):
-
-            with column:
-
-                st.metric(
-                    label,
-                    security_summary[
-                        category
-                    ]
-                )
-
-
-        # ====================================================
-        # RULE VS MISTRAL VS COMBINED
-        # ====================================================
-
-        st.subheader(
-            "Rule-Based vs Mistral vs Combined"
-        )
-
-
-        comparison_rows = []
-
-
-        for category, label in security_counts:
-
-            rule_risk_column = (
-                f"{category}_risk"
-            )
-
-            mistral_risk_column = (
-                f"{category}_mistral_risk"
-            )
-
-            combined_risk_column = (
-                f"{category}_combined_risk"
-            )
-
-
-            comparison_rows.append(
-                {
-                    "Security Category": label,
-
-                    "Rule-Based Risk": (
-                        security_results[
-                            rule_risk_column
-                        ]
-                        .replace(
-                            "",
-                            "Low"
-                        )
-                        .mode()
-                        .iloc[0]
-                        if rule_risk_column
-                        in security_results.columns
-                        else "N/A"
-                    ),
-
-                    "Mistral Risk": (
-                        security_results[
-                            mistral_risk_column
-                        ]
-                        .mode()
-                        .iloc[0]
-                        if mistral_risk_column
-                        in security_results.columns
-                        else "N/A"
-                    ),
-
-                    "Combined Risk": (
-                        security_results[
-                            combined_risk_column
-                        ]
-                        .mode()
-                        .iloc[0]
-                        if combined_risk_column
-                        in security_results.columns
-                        else "N/A"
-                    )
-                }
-            )
-
-
-        comparison_df = pd.DataFrame(
-            comparison_rows
-        )
-
-
-        st.dataframe(
-            comparison_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-        # ====================================================
-        # FULL SECURITY RESULTS
-        # ====================================================
-
-        st.subheader(
-            "Sample-Level Security Results"
-        )
-
-
-        summary_columns = [
-            "id",
-
-            "prompt_injection",
-            "prompt_injection_risk",
-            "prompt_injection_mistral_risk",
-            "prompt_injection_combined_risk",
-
-            "jailbreak",
-            "jailbreak_risk",
-            "jailbreak_mistral_risk",
-            "jailbreak_combined_risk",
-
-            "toxicity",
-            "toxicity_risk",
-            "toxicity_mistral_risk",
-            "toxicity_combined_risk",
-
-            "data_leakage",
-            "data_leakage_risk",
-            "data_leakage_mistral_risk",
-            "data_leakage_combined_risk",
-
-            "overall_security_risk",
-            "mistral_status"
-        ]
-
-
-        available_security_columns = [
-            column
-            for column in summary_columns
-            if column in security_results.columns
-        ]
-
-
-        st.dataframe(
-            security_results[
-                available_security_columns
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-        # ====================================================
-        # DOWNLOAD SECURITY RESULTS
-        # ====================================================
-
-        security_csv = (
-            security_results
-            .to_csv(index=False)
-            .encode("utf-8")
-        )
-
-
-        st.download_button(
-            label="⬇️ Download Combined Security Results",
-            data=security_csv,
-            file_name="combined_security_evaluation_results.csv",
-            mime="text/csv"
-        )
-
-
-        # ====================================================
-        # SECURITY SAMPLE INVESTIGATION
-        # ====================================================
-
-        st.subheader(
-            "🔐 Security Sample Investigation"
-        )
-
-
-        security_ids = (
-            security_results[
-                "id"
-            ].tolist()
-        )
-
-
-        selected_security_id = st.selectbox(
-            "Select a sample for security investigation",
-            security_ids,
-            format_func=format_sample_id,
-            key="security_sample"
-        )
-
-
-        security_row = security_results[
-            security_results["id"]
-            == selected_security_id
-        ].iloc[0]
-
-
-        # ====================================================
-        # OVERALL RISK
-        # ====================================================
-
-        overall_risk = security_row[
-            "overall_security_risk"
-        ]
-
-
-        if overall_risk == "High":
-
-            st.error(
-                f"🔴 Overall Security Risk: {overall_risk}"
-            )
-
-        elif overall_risk == "Medium":
-
-            st.warning(
-                f"🟠 Overall Security Risk: {overall_risk}"
-            )
-
-        else:
-
-            st.success(
-                f"🟢 Overall Security Risk: {overall_risk}"
-            )
-
-
-        # ====================================================
-        # MISTRAL STATUS FOR SELECTED SAMPLE
-        # ====================================================
-
-        selected_mistral_status = (
-            security_row.get(
-                "mistral_status",
-                "unknown"
-            )
-        )
-
-
-        if selected_mistral_status == "success":
-
-            st.success(
-                "🧠 Mistral semantic evaluation: Available"
-            )
-
-        elif selected_mistral_status == "unavailable":
-
-            st.warning(
-                "🧠 Mistral semantic evaluation: Unavailable"
-            )
-
-
-        # ====================================================
-        # CATEGORY INVESTIGATION
-        # ====================================================
-
-        st.markdown(
-            "### Security Checks"
-        )
-
-
-        for category, label in security_counts:
-
-            rule_detected = security_row.get(
-                category,
-                False
-            )
-
-            rule_risk = security_row.get(
-                f"{category}_risk",
-                "Low"
-            )
-
-            mistral_detected = security_row.get(
-                f"{category}_mistral_detected",
-                False
-            )
-
-            mistral_risk = security_row.get(
-                f"{category}_mistral_risk",
-                "Unavailable"
-            )
-
-            combined_risk = security_row.get(
-                f"{category}_combined_risk",
-                rule_risk
-            )
-
-
-            with st.expander(
-                f"🔎 {label}"
-            ):
-
-                col1, col2, col3 = st.columns(3)
-
-
-                with col1:
-
-                    st.markdown(
-                        "**Rule-Based**"
-                    )
-
-                    if rule_detected:
-
-                        st.error(
-                            f"Detected — {rule_risk}"
-                        )
-
-                    else:
-
-                        st.success(
-                            f"No indicator — {rule_risk}"
-                        )
-
-
-                with col2:
-
-                    st.markdown(
-                        "**Mistral**"
-                    )
-
-                    if mistral_risk == "Unavailable":
-
-                        st.warning(
-                            "Unavailable"
-                        )
-
-                    elif mistral_detected:
-
-                        st.error(
-                            f"Detected — {mistral_risk}"
-                        )
-
-                    else:
-
-                        st.success(
-                            f"No indicator — {mistral_risk}"
-                        )
-
-
-                with col3:
-
-                    st.markdown(
-                        "**Combined**"
-                    )
-
-
-                    if combined_risk == "High":
-
-                        st.error(
-                            f"High Risk"
-                        )
-
-                    elif combined_risk == "Medium":
-
-                        st.warning(
-                            f"Medium Risk"
-                        )
-
-                    else:
-
-                        st.success(
-                            f"Low Risk"
-                        )
-
-
-                reason = security_row.get(
-                    f"{category}_reason",
-                    ""
-                )
-
-                evidence = security_row.get(
-                    f"{category}_evidence",
-                    ""
-                )
-
-                recommendation = security_row.get(
-                    f"{category}_recommendation",
-                    ""
-                )
-
-
-                if reason:
-
-                    st.markdown(
-                        "**Reason**"
-                    )
-
-                    st.write(
-                        reason
-                    )
-
-
-                if evidence:
-
-                    st.markdown(
-                        "**Evidence**"
-                    )
-
-                    st.write(
-                        evidence
-                    )
-
-
-                if recommendation:
-
-                    st.markdown(
-                        "**Recommendation**"
-                    )
-
-                    st.info(
-                        recommendation
-                    )
-
-
-        # ====================================================
-        # ORIGINAL SECURITY EVIDENCE
-        # ====================================================
-
-        st.markdown(
-            "### 📚 Security Evidence"
-        )
-
-
-        original_security_row = get_original_row(
-            df,
-            selected_security_id
-        )
-
-
-        if original_security_row is not None:
-
-            with st.expander(
-                "❓ View User Query"
-            ):
-
-                st.write(
-                    original_security_row.get(
-                        question_column,
-                        "Not available"
-                    )
-                )
-
-
-            with st.expander(
-                "🤖 View Model Response"
-            ):
-
-                st.write(
-                    original_security_row.get(
-                        answer_column,
-                        "Not available"
-                    )
-                )
-
-
-            if context_column:
-
-                with st.expander(
-                    "📄 View Retrieved Context"
-                ):
-
-                    st.write(
-                        original_security_row.get(
-                            context_column,
-                            "Not available"
-                        )
-                    )
-
-
-            if ground_truth_column:
-
-                with st.expander(
-                    "🎯 View Ground Truth"
-                ):
-
-                    st.write(
-                        original_security_row.get(
-                            ground_truth_column,
-                            "Not available"
-                        )
-                    )
-
-
-    except Exception as e:
-
-        st.error(
-            f"Security evaluation failed: {e}"
-        )
 
 else:
 
     st.warning(
-        """
-        Security evaluation requires both a
-        question/query column and an answer/response column.
-        """
+        baseline.get(
+            "message",
+            "Baseline metrics are unavailable.",
+        )
     )
 
 
-
 # ============================================================
-# RELIABILITY & PERFORMANCE EVALUATION
+# FAILURE ANALYSIS
 # ============================================================
 
 st.divider()
 
 st.header(
-    "⚡ Reliability & Performance Evaluation"
+    "🚨 Failure Analysis"
 )
 
-st.markdown(
-    """
-AITrustEval evaluates reliability and performance only when the
-uploaded dataset contains the information required for each metric.
 
-Metrics that cannot be calculated from the uploaded dataset are
-reported as **Not Available** with the reason. No performance
-values are fabricated.
-"""
-)
+if not failure_df.empty:
 
-try:
+    failure_columns = st.columns(
+        4
+    )
 
-    with st.spinner(
-        "Running reliability and performance evaluation..."
-    ):
 
-        reliability_results = evaluate_reliability(
-            df
+    with failure_columns[0]:
+
+        st.metric(
+            "Total Failures",
+            failure_summary.get(
+                "total_failures",
+                0,
+            ),
         )
-        st.session_state.reliability_results = reliability_results
 
-    # ========================================================
-    # METRIC AVAILABILITY
-    # ========================================================
+
+    with failure_columns[1]:
+
+        st.metric(
+            "High Severity",
+            failure_summary.get(
+                "high",
+                0,
+            ),
+        )
+
+
+    with failure_columns[2]:
+
+        st.metric(
+            "Medium Severity",
+            failure_summary.get(
+                "medium",
+                0,
+            ),
+        )
+
+
+    with failure_columns[3]:
+
+        st.metric(
+            "Low Severity",
+            failure_summary.get(
+                "low",
+                0,
+            ),
+        )
+
 
     st.subheader(
-        "📊 Reliability Metric Availability"
+        "Failed Samples"
     )
 
-    available_reliability_metrics = (
-        reliability_results.get(
-            "available_metrics",
-            []
-        )
+
+    display_columns = [
+        "id",
+        "severity",
+        "failed_metrics",
+        "failure_count",
+    ]
+
+
+    available_columns = [
+        column
+        for column
+        in display_columns
+        if column in failure_df.columns
+    ]
+
+
+    st.table(failure_df[available_columns])
+
+
+    # --------------------------------------------------------
+    # SEVERITY CHART
+    # --------------------------------------------------------
+
+    severity_data = pd.DataFrame(
+        {
+            "Severity": [
+                "High",
+                "Medium",
+                "Low",
+            ],
+
+            "Samples": [
+                failure_summary.get(
+                    "high",
+                    0,
+                ),
+
+                failure_summary.get(
+                    "medium",
+                    0,
+                ),
+
+                failure_summary.get(
+                    "low",
+                    0,
+                ),
+            ],
+        }
     )
 
-    unavailable_reliability_metrics = (
-        reliability_results.get(
-            "unavailable_metrics",
-            []
-        )
+
+    severity_chart = px.bar(
+        severity_data,
+        x="Severity",
+        y="Samples",
+        title="Failure Severity Distribution",
+        text="Samples",
     )
 
-    col1, col2, col3 = st.columns(3)
 
-    with col1:
+    st.plotly_chart(
+        severity_chart,
+        use_container_width=True,
+    )
 
-        st.metric(
-            "Total Samples",
-            reliability_results.get(
-                "total_samples",
-                len(df)
+
+else:
+
+    st.info(
+        "No baseline failures require investigation."
+    )
+
+
+# ============================================================
+# ROOT CAUSE
+# ============================================================
+
+st.divider()
+
+st.header(
+    "🧬 Root-Cause Analysis"
+)
+
+
+if not root_cause_df.empty:
+
+    root_display_columns = [
+        "id",
+        "failed_metrics",
+        "failure_count",
+        "severity",
+        "root_cause",
+        "recommendation",
+    ]
+
+
+    available_root_columns = [
+        column
+        for column
+        in root_display_columns
+        if column in root_cause_df.columns
+    ]
+
+
+    st.table(root_cause_df[available_root_columns])
+
+
+    root_cause_counts = (
+        root_cause_df[
+            "root_cause"
+        ]
+        .value_counts()
+        .reset_index()
+    )
+
+
+    root_cause_counts.columns = [
+        "Root Cause",
+        "Occurrences",
+    ]
+
+
+    root_chart = px.bar(
+        root_cause_counts,
+        x="Root Cause",
+        y="Occurrences",
+        title="Root-Cause Distribution",
+        text="Occurrences",
+    )
+
+
+    root_chart.update_layout(
+        xaxis_tickangle=-30
+    )
+
+
+    st.plotly_chart(
+        root_chart,
+        use_container_width=True,
+    )
+
+
+    if recommendations:
+
+        st.subheader(
+            "💡 Recommendations"
+        )
+
+
+        for recommendation in (
+            recommendations
+        ):
+
+            st.info(
+                recommendation
             )
+
+
+else:
+
+    st.info(
+        "No root-cause findings are currently available."
+    )
+
+
+# ============================================================
+# EXPLAINABILITY
+# ============================================================
+
+st.divider()
+
+st.header(
+    "🧩 Explainability"
+)
+
+
+render_status(
+    "Explainability",
+    explainability,
+)
+
+
+if baseline_available:
+
+    st.info(
+        "Baseline metric-based failure analysis and sample-level evidence analysis are available. "
+        "RAGAS/LLM-based aggregate evaluation remains unavailable until the local Ollama/Mistral environment is available."
+    )
+
+
+st.metric(
+    "Samples Analyzed",
+    explainability.get(
+        "samples_analyzed",
+        0,
+    ),
+)
+
+
+# ============================================================
+# OVERALL BASELINE QUALITY
+# ============================================================
+
+st.subheader(
+    "Overall Baseline Quality"
+)
+
+
+if baseline_averages:
+
+    numeric_scores = [
+        float(value)
+        for value in
+        baseline_averages.values()
+        if value is not None
+    ]
+
+
+    if numeric_scores:
+
+        overall_score = sum(
+            numeric_scores
+        ) / len(
+            numeric_scores
         )
 
-    with col2:
 
-        st.metric(
-            "Available Metrics",
-            len(
-                available_reliability_metrics
+        if overall_score >= 0.75:
+
+            classification = "Good"
+
+        elif overall_score >= 0.50:
+
+            classification = "Warning"
+
+        else:
+
+            classification = "Poor"
+
+
+        quality_columns = (
+            st.columns(3)
+        )
+
+
+        with quality_columns[0]:
+
+            st.metric(
+                "Score",
+                f"{overall_score:.4f}",
             )
-        )
 
-    with col3:
 
-        st.metric(
-            "Unavailable Metrics",
-            len(
-                unavailable_reliability_metrics
+        with quality_columns[1]:
+
+            st.metric(
+                "Classification",
+                classification,
             )
-        )
 
-    if available_reliability_metrics:
 
-        st.success(
-            "✅ Available: "
-            + ", ".join(
-                available_reliability_metrics
+        with quality_columns[2]:
+
+            st.metric(
+                "Metrics Analyzed",
+                len(
+                    numeric_scores
+                ),
             )
+
+
+else:
+
+    st.info(
+        "No baseline aggregate scores are available."
+    )
+
+
+def _is_missing_text(value):
+
+    if value is None:
+        return True
+
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+
+    return not str(value).strip()
+
+
+BASELINE_ROOT_CAUSE_FALLBACKS = {
+
+    "answer_relevancy": (
+        "The generated answer may not adequately address the user's question.",
+        "Improve question understanding and constrain answer generation to the requested information.",
+    ),
+
+    "answer_correctness": (
+        "The generated answer may not sufficiently match the expected reference answer.",
+        "Improve answer generation and verify generated claims against the expected answer and supporting evidence.",
+    ),
+
+    "context_answer_similarity": (
+        "The generated answer may have weak alignment with the retrieved supporting context.",
+        "Improve retrieval relevance and context coverage, then verify answer claims against retrieved evidence.",
+    ),
+}
+
+
+def get_sample_root_cause(
+    selected_id,
+    selected_result,
+    root_cause_df,
+    failure_df,
+):
+    """Return robust sample-level root cause and recommendation details."""
+
+    selected_root = pd.DataFrame()
+
+    if (
+        isinstance(root_cause_df, pd.DataFrame)
+        and not root_cause_df.empty
+        and "id" in root_cause_df.columns
+    ):
+
+        selected_root = root_cause_df[
+            root_cause_df["id"].astype(str) == str(selected_id)
+        ]
+
+    if not selected_root.empty:
+
+        row = selected_root.iloc[0]
+
+        root_cause = row.get("root_cause")
+        recommendation = row.get("recommendation")
+        failed_metrics = row.get("failed_metrics")
+        severity = row.get("severity", "Unknown")
+
+        if (
+            not _is_missing_text(root_cause)
+            and not _is_missing_text(recommendation)
+        ):
+            return {
+                "severity": severity,
+                "failed_metrics": failed_metrics,
+                "root_cause": str(root_cause),
+                "recommendation": str(recommendation),
+            }
+
+    failed_metrics = []
+
+    if (
+        isinstance(failure_df, pd.DataFrame)
+        and not failure_df.empty
+        and "id" in failure_df.columns
+    ):
+
+        matching_failure = failure_df[
+            failure_df["id"].astype(str) == str(selected_id)
+        ]
+
+        if not matching_failure.empty:
+            failed_value = matching_failure.iloc[0].get(
+                "failed_metrics",
+                "",
+            )
+
+            if isinstance(failed_value, (list, tuple, set)):
+                failed_metrics = [
+                    str(metric).strip()
+                    for metric in failed_value
+                    if str(metric).strip()
+                ]
+            else:
+                failed_metrics = [
+                    metric.strip()
+                    for metric in str(failed_value).split(",")
+                    if metric.strip()
+                ]
+
+    if not failed_metrics:
+
+        for metric in BASELINE_ROOT_CAUSE_FALLBACKS:
+
+            try:
+                value = float(selected_result.get(metric))
+            except Exception:
+                continue
+
+            if value < 0.50:
+                failed_metrics.append(metric)
+
+    root_causes = []
+    recommendations_local = []
+
+    for metric in failed_metrics:
+
+        if metric in BASELINE_ROOT_CAUSE_FALLBACKS:
+            cause, recommendation = BASELINE_ROOT_CAUSE_FALLBACKS[metric]
+            root_causes.append(cause)
+            recommendations_local.append(recommendation)
+
+    failure_count = len(failed_metrics)
+
+    if failure_count >= 3:
+        severity = "High"
+    elif failure_count == 2:
+        severity = "Medium"
+    elif failure_count == 1:
+        severity = "Low"
+    else:
+        severity = "Unknown"
+
+    if not root_causes:
+        root_causes = [
+            "A low baseline metric was detected, but a specific root-cause mapping is not available for this metric."
+        ]
+
+    if not recommendations_local:
+        recommendations_local = [
+            "Review the failed metric together with the question, answer, ground truth and retrieved context."
+        ]
+
+    return {
+        "severity": severity,
+        "failed_metrics": ", ".join(failed_metrics) if failed_metrics else "Not available",
+        "root_cause": " | ".join(dict.fromkeys(root_causes)),
+        "recommendation": " | ".join(dict.fromkeys(recommendations_local)),
+    }
+
+
+# ============================================================
+# SAMPLE INVESTIGATION
+# ============================================================
+
+st.divider()
+
+st.header(
+    "🔎 Sample Investigation"
+)
+
+
+if not baseline_results.empty:
+
+    sample_ids = (
+        baseline_results[
+            "id"
+        ]
+        .tolist()
+    )
+
+
+    selected_id = st.selectbox(
+        "Select sample",
+        sample_ids,
+        format_func=format_sample_id,
+    )
+
+
+    selected_result = (
+        baseline_results[
+            baseline_results[
+                "id"
+            ]
+            == selected_id
+        ]
+    )
+
+
+    if not selected_result.empty:
+
+        selected_result = (
+            selected_result.iloc[0]
         )
 
-    if unavailable_reliability_metrics:
 
-        st.warning(
-            "Some reliability metrics cannot be calculated "
-            "from this dataset."
-        )
+        score_columns = [
+            column
+            for column
+            in [
+                "answer_relevancy",
+                "answer_correctness",
+                "context_answer_similarity",
+            ]
+            if column
+            in selected_result.index
+        ]
 
-        unavailable_reliability_df = pd.DataFrame(
-            unavailable_reliability_metrics
-        )
 
-        if not unavailable_reliability_df.empty:
+        if score_columns:
 
-            unavailable_reliability_df = (
-                unavailable_reliability_df.rename(
-                    columns={
-                        "metric": "Metric",
-                        "reason": "Reason"
-                    }
+            score_cards = st.columns(
+                len(
+                    score_columns
                 )
             )
 
-            st.dataframe(
-                unavailable_reliability_df[
-                    [
-                        "Metric",
-                        "Reason"
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True
-            )
 
-    # ========================================================
-    # LATENCY
-    # ========================================================
-
-    st.subheader(
-        "⏱️ Latency"
-    )
-
-    latency_result = reliability_results.get(
-        "latency",
-        {}
-    )
-
-    if latency_result.get(
-        "available",
-        False
-    ):
-
-        latency_col1, latency_col2, latency_col3, latency_col4 = (
-            st.columns(4)
-        )
-
-        with latency_col1:
-
-            st.metric(
-                "Mean",
-                f"{latency_result['mean']:.2f} ms"
-            )
-
-        with latency_col2:
-
-            st.metric(
-                "Median",
-                f"{latency_result['median']:.2f} ms"
-            )
-
-        with latency_col3:
-
-            st.metric(
-                "P95",
-                f"{latency_result['p95']:.2f} ms"
-            )
-
-        with latency_col4:
-
-            st.metric(
-                "P99",
-                f"{latency_result['p99']:.2f} ms"
-            )
-
-        st.caption(
-            f"Source column: "
-            f"`{latency_result.get('column', 'Unknown')}`"
-        )
-
-        latency_details = pd.DataFrame(
-            {
-                "Statistic": [
-                    "Minimum",
-                    "Mean",
-                    "Median",
-                    "Maximum",
-                    "P95",
-                    "P99"
-                ],
-                "Latency (ms)": [
-                    latency_result["min"],
-                    latency_result["mean"],
-                    latency_result["median"],
-                    latency_result["max"],
-                    latency_result["p95"],
-                    latency_result["p99"]
-                ]
-            }
-        )
-
-        with st.expander(
-            "View latency statistics"
-        ):
-
-            st.dataframe(
-                latency_details,
-                use_container_width=True,
-                hide_index=True
-            )
-
-    else:
-
-        st.info(
-            "ℹ️ Latency — Not Available\n\n"
-            + latency_result.get(
-                "reason",
-                "No valid latency information was found."
-            )
-        )
-
-    # ========================================================
-    # SUCCESS / FAILURE
-    # ========================================================
-
-    st.subheader(
-        "✅ Success / Failure"
-    )
-
-    success_failure_result = (
-        reliability_results.get(
-            "success_failure",
-            {}
-        )
-    )
-
-    if success_failure_result.get(
-        "available",
-        False
-    ):
-
-        sf_col1, sf_col2, sf_col3, sf_col4 = (
-            st.columns(4)
-        )
-
-        with sf_col1:
-
-            st.metric(
-                "Success Rate",
-                f"{success_failure_result['success_rate']:.2%}"
-            )
-
-        with sf_col2:
-
-            st.metric(
-                "Failure Rate",
-                f"{success_failure_result['failure_rate']:.2%}"
-            )
-
-        with sf_col3:
-
-            st.metric(
-                "Successful Samples",
-                success_failure_result[
-                    "success_count"
-                ]
-            )
-
-        with sf_col4:
-
-            st.metric(
-                "Failed Samples",
-                success_failure_result[
-                    "failure_count"
-                ]
-            )
-
-        st.caption(
-            f"Source column: "
-            f"`{success_failure_result.get('column', 'Unknown')}`"
-        )
-
-    else:
-
-        st.info(
-            "ℹ️ Success / Failure — Not Available\n\n"
-            + success_failure_result.get(
-                "reason",
-                "No usable status information was found."
-            )
-        )
-
-    # ========================================================
-    # RESPONSE CONSISTENCY
-    # ========================================================
-
-    st.subheader(
-        "🔄 Response Consistency"
-    )
-
-    consistency_result = (
-        reliability_results.get(
-            "consistency",
-            {}
-        )
-    )
-
-    if consistency_result.get(
-        "available",
-        False
-    ):
-
-        consistency_col1, consistency_col2 = (
-            st.columns(2)
-        )
-
-        with consistency_col1:
-
-            st.metric(
-                "Consistency Score",
-                f"{consistency_result['consistency_score']:.4f}"
-            )
-
-        with consistency_col2:
-
-            st.metric(
-                "Repeated Question Groups",
-                consistency_result[
-                    "repeated_question_groups"
-                ]
-            )
-
-        st.caption(
-            consistency_result.get(
-                "method",
-                "Consistency methodology not specified."
-            )
-        )
-
-        consistency_groups = (
-            consistency_result.get(
-                "groups",
-                []
-            )
-        )
-
-        if consistency_groups:
-
-            with st.expander(
-                "View consistency by repeated question"
+            for index, metric in enumerate(
+                score_columns
             ):
 
-                consistency_df = pd.DataFrame(
-                    consistency_groups
-                )
+                with score_cards[
+                    index
+                ]:
 
-                st.dataframe(
-                    consistency_df,
-                    use_container_width=True,
-                    hide_index=True
-                )
+                    value = (
+                        selected_result[
+                            metric
+                        ]
+                    )
 
-    else:
 
-        st.info(
-            "ℹ️ Response Consistency — Not Available\n\n"
-            + consistency_result.get(
-                "reason",
-                "Consistency could not be calculated."
+                    st.metric(
+                        normalize_metric_name(
+                            metric
+                        ),
+                        f"{float(value):.4f}",
+                    )
+
+
+        # ----------------------------------------------------
+        # FAILURE INFORMATION
+        # ----------------------------------------------------
+
+        sample_root_cause = get_sample_root_cause(
+            selected_id=selected_id,
+            selected_result=selected_result,
+            root_cause_df=root_cause_df,
+            failure_df=failure_df,
+        )
+
+
+        severity = sample_root_cause.get(
+            "severity",
+            "Unknown",
+        )
+
+
+        if severity == "High":
+
+            st.error(
+                f"🚨 High Severity — Sample "
+                f"{format_sample_id(selected_id)}"
             )
+
+        elif severity == "Medium":
+
+            st.warning(
+                f"⚠️ Medium Severity — Sample "
+                f"{format_sample_id(selected_id)}"
+            )
+
+        elif severity == "Low":
+
+            st.info(
+                f"ℹ️ Low Severity — Sample "
+                f"{format_sample_id(selected_id)}"
+            )
+
+        else:
+
+            st.info(
+                f"ℹ️ Sample {format_sample_id(selected_id)}"
+            )
+
+
+        st.markdown(
+            "### ❌ Failed Metrics"
         )
 
-    # ========================================================
-    # ROBUSTNESS
-    # ========================================================
-
-    st.subheader(
-        "🧪 Robustness"
-    )
-
-    robustness_result = (
-        reliability_results.get(
-            "robustness",
-            {}
-        )
-    )
-
-    if robustness_result.get(
-        "available",
-        False
-    ):
-
-        st.success(
-            "✅ Robustness input data is available."
-        )
 
         st.write(
-            robustness_result.get(
-                "message",
-                "Variation data is available."
+            sample_root_cause.get(
+                "failed_metrics",
+                "Not available",
             )
         )
 
-        if robustness_result.get(
-            "column"
-        ):
 
-            st.caption(
-                f"Variation column: "
-                f"`{robustness_result['column']}`"
+        st.markdown(
+            "### 🧬 Possible Root Cause"
+        )
+
+
+        st.warning(
+            sample_root_cause.get(
+                "root_cause",
+                "Root cause unavailable.",
             )
+        )
+
+
+        st.markdown(
+            "### 💡 Recommendation"
+        )
+
 
         st.info(
-            "A final robustness score requires a defined "
-            "original-to-variant evaluation methodology. "
-            "AITrustEval does not invent a robustness score."
-        )
-
-    else:
-
-        st.info(
-            "ℹ️ Robustness — Not Available\n\n"
-            + robustness_result.get(
-                "reason",
-                "No robustness evaluation data was detected."
+            sample_root_cause.get(
+                "recommendation",
+                "No recommendation available.",
             )
         )
 
-    # ========================================================
-    # RELIABILITY SUMMARY DOWNLOAD
-    # ========================================================
 
-    st.subheader(
-        "📥 Reliability Summary"
-    )
+        # ----------------------------------------------------
+        # ORIGINAL DATA
+        # ----------------------------------------------------
 
-    reliability_download_rows = []
-
-    for metric_name in [
-        "latency",
-        "success_failure",
-        "consistency",
-        "robustness"
-    ]:
-
-        metric_result = reliability_results.get(
-            metric_name,
-            {}
+        original_row = (
+            get_original_row(
+                df,
+                selected_id,
+            )
         )
 
-        reliability_download_rows.append(
-            {
-                "Metric": metric_name,
-                "Available": metric_result.get(
-                    "available",
-                    False
-                ),
-                "Reason": metric_result.get(
-                    "reason",
-                    ""
+
+        if original_row is not None:
+
+            st.markdown(
+                "### 📚 Original Dataset Evidence"
+            )
+
+
+            question_column = (
+                schema.get(
+                    "question"
                 )
-            }
-        )
+            )
 
-    reliability_summary_df = pd.DataFrame(
-        reliability_download_rows
-    )
 
-    st.download_button(
-        label="⬇️ Download Reliability Summary",
-        data=reliability_summary_df.to_csv(
-            index=False
-        ).encode("utf-8"),
-        file_name="reliability_summary.csv",
-        mime="text/csv"
-    )
+            answer_column = (
+                schema.get(
+                    "answer"
+                )
+            )
 
-except Exception as e:
 
-    st.error(
-        f"Reliability evaluation failed: {e}"
-    )
+            ground_truth_column = (
+                schema.get(
+                    "ground_truth"
+                )
+            )
 
-    with st.expander(
-        "View reliability error details"
-    ):
 
-        st.exception(e)
+            context_column = (
+                schema.get(
+                    "context"
+                )
+            )
+
+
+            metadata_column = (
+                schema.get(
+                    "metadata"
+                )
+            )
+
+
+            with st.expander(
+                "❓ View Question"
+            ):
+
+                st.write(
+                    safe_value(
+                        original_row.get(
+                            question_column
+                        )
+                    )
+                )
+
+
+            with st.expander(
+                "🤖 View Generated Answer"
+            ):
+
+                st.write(
+                    safe_value(
+                        original_row.get(
+                            answer_column
+                        )
+                    )
+                )
+
+
+            with st.expander(
+                "🎯 View Ground Truth"
+            ):
+
+                st.write(
+                    safe_value(
+                        original_row.get(
+                            ground_truth_column
+                        )
+                    )
+                )
+
+
+            with st.expander(
+                "📄 View Retrieved Context"
+            ):
+
+                if context_column:
+
+                    context_chunks = (
+                        parse_context(
+                            original_row.get(
+                                context_column
+                            )
+                        )
+                    )
+
+
+                    for chunk in (
+                        context_chunks
+                    ):
+
+                        if isinstance(
+                            chunk,
+                            dict,
+                        ):
+
+                            rank = (
+                                chunk.get(
+                                    "rank",
+                                    "N/A",
+                                )
+                            )
+
+
+                            text = (
+                                chunk.get(
+                                    "context",
+                                    chunk.get(
+                                        "text",
+                                        "",
+                                    ),
+                                )
+                            )
+
+
+                            st.markdown(
+                                f"**Rank {rank}**"
+                            )
+
+
+                            st.write(
+                                text
+                            )
+
+
+                            st.divider()
+
+                        else:
+
+                            st.write(
+                                chunk
+                            )
+
+
+            if metadata_column:
+
+                with st.expander(
+                    "🗂️ View Metadata"
+                ):
+
+                    st.write(
+                        safe_value(
+                            original_row.get(
+                                metadata_column
+                            )
+                        )
+                    )
 
 
 # ============================================================
-# CURRENT LIMITATIONS
+# RAGAS
 # ============================================================
 
 st.divider()
 
 st.header(
-    "⚠️ Current Evaluation Limitations"
+    "🧠 RAG / LLM Evaluation"
 )
+
+
+ragas = evaluation.get(
+    "ragas",
+    {},
+)
+
+
+render_status(
+    "RAGAS",
+    ragas,
+)
+
+
+if ragas.get(
+    "status"
+) == "unavailable":
+
+    st.info(
+        """
+        RAGAS is unavailable in the current Windows
+        development environment because Ollama/Mistral
+        is not available.
+
+        The approved DRDO offline environment can run
+        the same evaluation pipeline using the local
+        evaluator model.
+        """
+    )
+
+
+# ============================================================
+# RETRIEVAL
+# ============================================================
+
+st.divider()
+
+st.header(
+    "🔎 Retrieval Quality"
+)
+
+
+retrieval = evaluation.get(
+    "retrieval",
+    {},
+)
+
+
+render_status(
+    "Retrieval",
+    retrieval,
+)
+
+
+retrieval_summary = retrieval.get(
+    "summary",
+    {},
+)
+
+
+retrieval_metrics = [
+    "precision@5",
+    "recall@5",
+    "mrr",
+    "ndcg@5",
+    "hit_rate@5",
+]
+
+
+retrieval_cards = st.columns(
+    5
+)
+
+
+for index, metric in enumerate(
+    retrieval_metrics
+):
+
+    with retrieval_cards[
+        index
+    ]:
+
+        value = (
+            retrieval_summary.get(
+                metric
+            )
+        )
+
+
+        if value is None:
+
+            st.metric(
+                metric.upper(),
+                "N/A",
+            )
+
+        else:
+
+            st.metric(
+                metric.upper(),
+                f"{float(value):.4f}",
+            )
+
+
+# ============================================================
+# SECURITY
+# ============================================================
+
+st.divider()
+
+st.header(
+    "🛡️ Security & Safety"
+)
+
+
+security = evaluation.get(
+    "security",
+    {},
+)
+
+
+render_status(
+    "Security",
+    security,
+)
+
+
+security_summary = security.get(
+    "summary",
+    {},
+)
+
+
+if security_summary:
+
+    security_cards = st.columns(
+        4
+    )
+
+
+    security_values = [
+        (
+            "Total Samples",
+            "total_samples",
+        ),
+
+        (
+            "High Risk",
+            "high_risk",
+        ),
+
+        (
+            "Medium Risk",
+            "medium_risk",
+        ),
+
+        (
+            "Low Risk",
+            "low_risk",
+        ),
+    ]
+
+
+    for index, (
+        label,
+        key,
+    ) in enumerate(
+        security_values
+    ):
+
+        with security_cards[
+            index
+        ]:
+
+            st.metric(
+                label,
+                security_summary.get(
+                    key,
+                    0,
+                ),
+            )
+
+
+    risk_df = pd.DataFrame(
+        {
+            "Risk Level": [
+                "High Risk",
+                "Medium Risk",
+                "Low Risk",
+            ],
+
+            "Samples": [
+                security_summary.get(
+                    "high_risk",
+                    0,
+                ),
+
+                security_summary.get(
+                    "medium_risk",
+                    0,
+                ),
+
+                security_summary.get(
+                    "low_risk",
+                    0,
+                ),
+            ],
+        }
+    )
+
+
+    security_chart = px.bar(
+        risk_df,
+        x="Risk Level",
+        y="Samples",
+        title="Security Risk Distribution",
+        text="Samples",
+    )
+
+
+    st.plotly_chart(
+        security_chart,
+        use_container_width=True,
+    )
+
+
+    check_df = pd.DataFrame(
+        {
+            "Security Check": [
+                "Prompt Injection",
+                "Jailbreak",
+                "Toxicity",
+                "Data Leakage",
+            ],
+
+            "Detected": [
+                security_summary.get(
+                    "prompt_injection",
+                    0,
+                ),
+
+                security_summary.get(
+                    "jailbreak",
+                    0,
+                ),
+
+                security_summary.get(
+                    "toxicity",
+                    0,
+                ),
+
+                security_summary.get(
+                    "data_leakage",
+                    0,
+                ),
+            ],
+        }
+    )
+
+
+    check_chart = px.bar(
+        check_df,
+        x="Security Check",
+        y="Detected",
+        title="Security Detection Results",
+        text="Detected",
+    )
+
+
+    st.plotly_chart(
+        check_chart,
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# RELIABILITY
+# ============================================================
+
+st.divider()
+
+st.header(
+    "⚙️ Reliability & Performance"
+)
+
+
+reliability = evaluation.get(
+    "reliability",
+    {},
+)
+
+
+render_status(
+    "Reliability",
+    reliability,
+)
+
+
+available_reliability = (
+    reliability.get(
+        "available_metrics",
+        [],
+    )
+)
+
+
+unavailable_reliability = (
+    reliability.get(
+        "unavailable_metrics",
+        [],
+    )
+)
+
+
+if available_reliability:
+
+    st.success(
+        "Available: "
+        + ", ".join(
+            map(
+                str,
+                available_reliability,
+            )
+        )
+    )
+
+
+if unavailable_reliability:
+
+    reliability_rows = []
+
+
+    for item in (
+        unavailable_reliability
+    ):
+
+        if isinstance(
+            item,
+            dict,
+        ):
+
+            reliability_rows.append(
+                {
+                    "Metric":
+                        item.get(
+                            "metric",
+                            "Unknown",
+                        ),
+
+                    "Reason":
+                        item.get(
+                            "reason",
+                            "Not available.",
+                        ),
+                }
+            )
+
+        else:
+
+            reliability_rows.append(
+                {
+                    "Metric":
+                        str(item),
+
+                    "Reason":
+                        "Not available.",
+                }
+            )
+
+
+    if reliability_rows:
+
+        st.table(pd.DataFrame(reliability_rows))
+
+
+# ============================================================
+# EXPORT EVALUATION JSON
+# ============================================================
+
+st.divider()
+
+st.header(
+    "📥 Export Results"
+)
+
+
+evaluation_json = json.dumps(
+    evaluation,
+    indent=2,
+    default=str,
+)
+
+
+st.download_button(
+    label="⬇️ Download Evaluation JSON",
+    data=evaluation_json,
+    file_name="aitrust_eval_results.json",
+    mime="application/json",
+)
+
+
+explainability_json = json.dumps(
+    explainability,
+    indent=2,
+    default=str,
+)
+
+
+st.download_button(
+    label="⬇️ Download Explainability JSON",
+    data=explainability_json,
+    file_name="aitrust_eval_explainability.json",
+    mime="application/json",
+)
+
+
+# ============================================================
+# REPORT
+# ============================================================
+
+st.divider()
+
+st.header(
+    "📄 Generate Evaluation Report"
+)
+
 
 st.markdown(
     """
-    - Baseline answer-quality scores currently use
-      TF-IDF similarity.
-    - Ragas LLM-based evaluation requires the approved
-      local Ollama + Mistral environment.
-    - Retrieval metrics such as Precision@K, Recall@K,
-      MRR, NDCG and Hit Rate require ranked retrieval
-      results and relevance information.
-    - Current failure thresholds are preliminary
-      investigation thresholds.
-    - Rule-based security checks are preliminary
-      screening mechanisms.
-    - Mistral semantic security evaluation becomes
-      available when the approved local Ollama + Mistral
-      environment is available.
-    - Combined security risk uses the highest risk detected
-      across the rule-based and Mistral evaluations.
+    Generate the complete AITrustEval HTML and PDF report.
+
+    The report includes the baseline answer-quality metrics,
+    RAGAS status, security, reliability, failure analysis,
+    root-cause analysis and recommendations.
     """
 )
+
+
+if st.button(
+    "📄 Generate HTML + PDF Report",
+    use_container_width=True,
+):
+
+    try:
+
+        report_data = build_report_data(
+            evaluation_result=evaluation,
+
+            dataset_info=dataset_info,
+
+            schema_mapping=schema,
+
+            metric_availability=
+                evaluation.get(
+                    "metric_availability",
+                    {},
+                ),
+
+            baseline_metrics=
+                baseline,
+
+            retrieval_result=
+                evaluation.get(
+                    "retrieval",
+                    {},
+                ),
+
+            ragas_result=
+                evaluation.get(
+                    "ragas",
+                    {},
+                ),
+
+            security_result=
+                evaluation.get(
+                    "security",
+                    {},
+                ),
+
+            reliability_result=
+                evaluation.get(
+                    "reliability",
+                    {},
+                ),
+
+            failure_summary=
+                failure_summary,
+
+            root_cause_report=
+                root_cause_df,
+
+            recommendations=
+                recommendations,
+
+            explainability_result=
+                explainability,
+        )
+
+
+        report_paths = (
+            generate_reports(
+                report_data
+            )
+        )
+
+
+        st.success(
+            "✅ HTML and PDF reports generated successfully."
+        )
+
+
+        html_path = Path(
+            report_paths[
+                "html"
+            ]
+        )
+
+
+        pdf_path = Path(
+            report_paths[
+                "pdf"
+            ]
+        )
+
+
+        if html_path.exists():
+
+            st.download_button(
+                label="⬇️ Download HTML Report",
+
+                data=
+                    html_path.read_bytes(),
+
+                file_name=
+                    html_path.name,
+
+                mime="text/html",
+            )
+
+
+        if pdf_path.exists():
+
+            st.download_button(
+                label="⬇️ Download PDF Report",
+
+                data=
+                    pdf_path.read_bytes(),
+
+                file_name=
+                    pdf_path.name,
+
+                mime="application/pdf",
+            )
+
+
+    except Exception as error:
+
+        st.error(
+            f"Report generation failed: {error}"
+        )
+
+        st.exception(
+            error
+        )
+
+
+# ============================================================
+# METHODOLOGY
+# ============================================================
+
+st.divider()
+
+st.header(
+    "ℹ️ Methodology & Limitations"
+)
+
+
+with st.expander(
+    "📖 View Methodology"
+):
+
+    st.markdown(
+        """
+### Baseline Answer Quality
+
+AITrustEval calculates:
+
+- Answer Relevancy
+- Answer Correctness
+- Context-Answer Similarity
+
+using a lightweight offline TF-IDF cosine-similarity baseline.
+
+These scores are intended for baseline comparison and
+failure screening.
+
+They are **not equivalent to RAGAS or an LLM-as-a-judge
+evaluation**.
+
+### Retrieval
+
+Semantic retrieval metrics require the local embedding
+environment.
+
+When explicit relevance labels are unavailable, retrieval
+scores are treated as semantic/proxy retrieval measurements.
+
+### RAG / LLM
+
+RAGAS uses the approved local evaluator environment.
+
+The current development laptop does not require Ollama.
+
+### Security
+
+Security evaluation includes:
+
+- Prompt Injection
+- Jailbreak
+- Toxicity
+- Data Leakage
+
+### Reliability
+
+Latency requires timing information.
+
+Success/failure requires status information.
+
+Consistency requires repeated questions.
+
+Robustness requires controlled prompt variations or
+perturbations.
+
+### Explainability
+
+AITrustEval provides:
+
+- Evidence analysis
+- Evidence-gap analysis
+- Failure analysis
+- Root-cause analysis
+- Recommendations
+
+### Reporting
+
+Only metrics supported by the dataset and available
+evaluation environment are reported.
+
+Unavailable metrics are not fabricated.
+"""
+    )
 
 
 # ============================================================
@@ -2612,486 +2955,9 @@ st.markdown(
 st.divider()
 
 st.caption(
-    "AITrustEval — Offline AI/ML Trustworthiness Evaluation Platform"
-)
-# ============================================================
-# REPORT GENERATION
-# ============================================================
-
-st.divider()
-
-st.header("📄 Evaluation Report Generation")
-
-st.markdown(
-    """
-    Generate a professional AITrustEval evaluation report from the
-    results of the current dataset analysis.
-
-    The report can include:
-
-    - Dataset information
-    - Detected schema
-    - Metric availability
-    - Baseline evaluation
-    - RAGAS / LLM evaluation
-    - Security evaluation
-    - Reliability and performance
-    - Failure analysis
-    - Root-cause analysis
-    - Recommendations
-
-    Metrics that cannot be calculated from the uploaded dataset
-    are reported as unavailable instead of being fabricated.
-    """
+    "AITrustEval — Offline AI/ML Trustworthiness, Security & Reliability Evaluation Platform"
 )
 
-
-# ============================================================
-# CHECK WHETHER ANALYSIS WAS COMPLETED
-# ============================================================
-
-if "evaluation" not in locals():
-
-    st.info(
-        "Run the dataset analysis first. "
-        "The report will be generated from the current analysis results."
-    )
-
-else:
-
-    try:
-
-        # ----------------------------------------------------
-        # Import report functions
-        # ----------------------------------------------------
-
-        from outputs.reports.report_generator import (
-            build_report_data,
-            generate_html_report,
-            generate_pdf_report
-        )
-
-
-        # ====================================================
-        # BASELINE METRICS
-        # ====================================================
-
-        report_baseline_metrics = {}
-
-        if (
-            "results_df" in locals()
-            and isinstance(results_df, pd.DataFrame)
-            and not results_df.empty
-        ):
-
-            baseline_metrics = [
-                "answer_relevancy",
-                "answer_correctness",
-                "context_answer_similarity"
-            ]
-
-            for metric in baseline_metrics:
-
-                if metric in results_df.columns:
-
-                    values = pd.to_numeric(
-                        results_df[metric],
-                        errors="coerce"
-                    )
-
-                    if values.notna().any():
-
-                        report_baseline_metrics[metric] = float(
-                            values.mean()
-                        )
-
-
-        # ====================================================
-        # RAGAS RESULTS
-        # ====================================================
-
-        report_ragas_result = {}
-
-        if (
-            "ragas_results" in locals()
-            and isinstance(ragas_results, pd.DataFrame)
-            and not ragas_results.empty
-        ):
-
-            ragas_metrics = {}
-
-            for metric in [
-                "faithfulness",
-                "answer_relevancy",
-                "answer_correctness",
-                "context_precision",
-                "context_recall"
-            ]:
-
-                if metric in ragas_results.columns:
-
-                    values = pd.to_numeric(
-                        ragas_results[metric],
-                        errors="coerce"
-                    )
-
-                    if values.notna().any():
-
-                        ragas_metrics[metric] = float(
-                            values.mean()
-                        )
-
-            report_ragas_result = {
-                "metrics": ragas_metrics
-            }
-
-
-        # ====================================================
-        # SECURITY RESULTS
-        # ====================================================
-
-        report_security_result = {}
-
-        if (
-            "security_results" in locals()
-            and isinstance(security_results, pd.DataFrame)
-            and not security_results.empty
-        ):
-
-            try:
-
-                report_security_result = {
-                    "summary": summarize_security(
-                        security_results
-                    )
-                }
-
-            except Exception:
-
-                report_security_result = {}
-
-
-        # ====================================================
-        # RELIABILITY RESULTS
-        # ====================================================
-
-        report_reliability_result = {}
-
-        if "reliability_results" in locals():
-
-            if isinstance(
-                reliability_results,
-                dict
-            ):
-
-                report_reliability_result = (
-                    reliability_results
-                )
-
-
-        # ====================================================
-        # FAILURE SUMMARY
-        # ====================================================
-
-        report_failure_summary = {}
-
-        if "failure_summary" in locals():
-
-            if isinstance(
-                failure_summary,
-                dict
-            ):
-
-                report_failure_summary = (
-                    failure_summary
-                )
-
-
-        # ====================================================
-        # ROOT CAUSE REPORT
-        # ====================================================
-
-        report_root_cause = None
-
-        if (
-            "root_cause_df" in locals()
-            and isinstance(
-                root_cause_df,
-                pd.DataFrame
-            )
-            and not root_cause_df.empty
-        ):
-
-           report_root_cause = root_cause_df.to_dict(
-    orient="records"
+st.caption(
+    "Development: Windows | Deployment Target: Approved Offline Ubuntu / DRDO"
 )
-
-
-        # ====================================================
-        # RECOMMENDATIONS
-        # ====================================================
-
-        report_recommendations = []
-
-        if (
-            "root_cause_df" in locals()
-            and isinstance(
-                root_cause_df,
-                pd.DataFrame
-            )
-            and not root_cause_df.empty
-            and "recommendation" in root_cause_df.columns
-        ):
-
-            recommendations = (
-                root_cause_df["recommendation"]
-                .dropna()
-                .astype(str)
-                .tolist()
-            )
-
-            # Remove duplicate recommendations
-            report_recommendations = list(
-                dict.fromkeys(
-                    recommendations
-                )
-            )
-
-
-        # ====================================================
-        # BUILD COMPLETE REPORT DATA
-        # ====================================================
-
-        report_data = build_report_data(
-
-            evaluation_result=evaluation,
-
-            dataset_info=dataset_info,
-
-            schema_mapping=detected_columns,
-
-            metric_availability=availability,
-
-            baseline_metrics={
-                "averages": report_baseline_metrics
-            },
-
-            ragas_result=report_ragas_result,
-
-            security_result=report_security_result,
-
-            reliability_result=report_reliability_result,
-
-            failure_summary=report_failure_summary,
-
-            root_cause_report=report_root_cause,
-
-            recommendations=report_recommendations
-        )
-
-
-        # ====================================================
-        # REPORT BUTTONS
-        # ====================================================
-
-        st.subheader("📑 Generate Reports")
-
-        st.caption(
-            "Reports are saved automatically inside "
-            "outputs/reports/"
-        )
-
-
-        col1, col2, col3 = st.columns(3)
-
-
-        # ====================================================
-        # PDF
-        # ====================================================
-
-        with col1:
-
-            if st.button(
-                "📄 Generate PDF",
-                use_container_width=True
-            ):
-
-                with st.spinner(
-                    "Generating PDF report..."
-                ):
-
-                    pdf_path = generate_pdf_report(
-                        report_data
-                    )
-
-                st.success(
-                    "PDF report generated successfully."
-                )
-
-                with open(
-                    pdf_path,
-                    "rb"
-                ) as file:
-
-                    st.download_button(
-
-                        label="⬇️ Download PDF",
-
-                        data=file.read(),
-
-                        file_name=pdf_path.name,
-
-                        mime="application/pdf",
-
-                        use_container_width=True
-                    )
-
-
-        # ====================================================
-        # HTML
-        # ====================================================
-
-        with col2:
-
-            if st.button(
-                "🌐 Generate HTML",
-                use_container_width=True
-            ):
-
-                with st.spinner(
-                    "Generating HTML report..."
-                ):
-
-                    html_path = generate_html_report(
-                        report_data
-                    )
-
-                st.success(
-                    "HTML report generated successfully."
-                )
-
-                with open(
-                    html_path,
-                    "rb"
-                ) as file:
-
-                    st.download_button(
-
-                        label="⬇️ Download HTML",
-
-                        data=file.read(),
-
-                        file_name=html_path.name,
-
-                        mime="text/html",
-
-                        use_container_width=True
-                    )
-
-
-        # ====================================================
-        # BOTH REPORTS
-        # ====================================================
-
-        with col3:
-
-            if st.button(
-                "📦 Generate Both",
-                use_container_width=True
-            ):
-
-                with st.spinner(
-                    "Generating PDF and HTML reports..."
-                ):
-
-                    pdf_path = generate_pdf_report(
-                        report_data
-                    )
-
-                    html_path = generate_html_report(
-                        report_data
-                    )
-
-                st.success(
-                    "PDF and HTML reports generated successfully."
-                )
-
-                st.markdown("### Download Reports")
-
-                download_col1, download_col2 = st.columns(2)
-
-
-                # PDF DOWNLOAD
-                with download_col1:
-
-                    with open(
-                        pdf_path,
-                        "rb"
-                    ) as file:
-
-                        st.download_button(
-
-                            label="⬇️ PDF",
-
-                            data=file.read(),
-
-                            file_name=pdf_path.name,
-
-                            mime="application/pdf",
-
-                            use_container_width=True
-                        )
-
-
-                # HTML DOWNLOAD
-                with download_col2:
-
-                    with open(
-                        html_path,
-                        "rb"
-                    ) as file:
-
-                        st.download_button(
-
-                            label="⬇️ HTML",
-
-                            data=file.read(),
-
-                            file_name=html_path.name,
-
-                            mime="text/html",
-
-                            use_container_width=True
-                        )
-
-
-        # ====================================================
-        # REPORT LOCATION
-        # ====================================================
-
-        st.info(
-            """
-            📁 Reports are stored in:
-
-            `AITrustEval/outputs/reports/`
-
-            No additional folder is required.
-            """
-        )
-
-
-    # ========================================================
-    # REPORT ERROR
-    # ========================================================
-
-    except Exception as e:
-
-        st.error(
-            f"Report generation error: {e}"
-        )
-
-        with st.expander(
-            "🔍 View Technical Error"
-        ):
-
-            st.exception(e)

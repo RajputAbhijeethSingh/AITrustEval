@@ -1,15 +1,37 @@
-"""
-AITrustEval - Ragas Evaluation
-
-Uses the centralized Model Manager so the LLM judge is not hard-coded.
-Designed for offline/local Ollama execution.
-"""
+# ============================================================
+# AITrustEval - Ragas Evaluation
+# ============================================================
+#
+# Purpose:
+#   Evaluate RAG/LLM answer quality using Ragas.
+#
+# Supported metrics:
+#   - Faithfulness
+#   - Answer Relevancy
+#   - Answer Correctness
+#   - Context Precision
+#   - Context Recall
+#
+# Designed for:
+#   - Offline execution
+#   - Local Ollama
+#   - Local Mistral / approved LLM models
+#   - AITrustEval 5-field dataset
+#
+# Dataset fields:
+#   question
+#   context
+#   answer
+#   metadata
+#   ground_truth
+# ============================================================
 
 from typing import Dict, Optional
+import ast
+import json
 
 import pandas as pd
 
-from evaluation.dataset.schema_detector import validate_dataset
 from evaluation.llm.model_manager import (
     select_llm_model,
     select_embedding_model,
@@ -18,11 +40,18 @@ from evaluation.llm.model_manager import (
 
 from evaluation.llm.ollama_client import (
     is_ollama_available,
+    is_model_available,
 )
 
-# Ragas
+
+# ============================================================
+# RAGAS IMPORT
+# ============================================================
+
 try:
+
     from ragas import EvaluationDataset, evaluate
+
     from ragas.metrics.collections import (
         Faithfulness,
         AnswerRelevancy,
@@ -34,6 +63,7 @@ try:
     RAGAS_AVAILABLE = True
 
 except Exception:
+
     RAGAS_AVAILABLE = False
 
 
@@ -52,31 +82,58 @@ def check_ragas_environment(
     model: Optional[str] = None,
 ) -> Dict:
     """
-    Check whether the local environment is ready for Ragas.
+    Check whether the local Ragas environment is ready.
 
-    Model selection is delegated to the Model Manager.
+    No cloud API is used.
     """
 
-    selected_model = model or select_llm_model(DEFAULT_MODEL)
+    selected_model = (
+        model
+        or select_llm_model(
+            DEFAULT_MODEL
+        )
+    )
 
-    ollama_available = is_ollama_available()
+    ollama_available = (
+        is_ollama_available()
+    )
 
     model_available = False
 
-    if ollama_available and selected_model:
-        from evaluation.llm.ollama_client import is_model_available
+    if (
+        ollama_available
+        and selected_model
+    ):
 
         try:
-            model_available = is_model_available(selected_model)
+
+            model_available = (
+                is_model_available(
+                    selected_model
+                )
+            )
+
         except Exception:
+
             model_available = False
 
     return {
-        "ragas_installed": RAGAS_AVAILABLE,
-        "ollama_available": ollama_available,
-        "model": selected_model,
-        "model_available": model_available,
-        "embedding_model": select_embedding_model(),
+
+        "ragas_installed":
+            RAGAS_AVAILABLE,
+
+        "ollama_available":
+            ollama_available,
+
+        "model":
+            selected_model,
+
+        "model_available":
+            model_available,
+
+        "embedding_model":
+            select_embedding_model(),
+
         "ready": (
             RAGAS_AVAILABLE
             and ollama_available
@@ -91,90 +148,412 @@ def check_ragas_environment(
 
 def clean_value(value):
     """
-    Convert dataset values into formats accepted by Ragas.
+    Convert missing values into empty strings.
     """
 
     if value is None:
         return ""
 
-    if isinstance(value, float) and pd.isna(value):
+    if isinstance(
+        value,
+        float
+    ) and pd.isna(value):
+
         return ""
 
     return value
 
 
+# ============================================================
+# CONTEXT PARSING
+# ============================================================
+
 def prepare_context(value):
     """
-    Convert context values into a list of strings.
+    Convert context into a list of strings.
 
-    Handles:
-    - list
-    - tuple
-    - string
-    - string representation of a list
+    Supports:
+
+        list
+        tuple
+        JSON list
+        Python list string
+        dictionary
+        normal string
+
+    Example:
+
+        '["chunk 1", "chunk 2"]'
+
+    becomes:
+
+        ["chunk 1", "chunk 2"]
     """
 
-    value = clean_value(value)
+    value = clean_value(
+        value
+    )
 
-    if isinstance(value, list):
-        return [str(item) for item in value]
+    # --------------------------------------------------------
+    # Already a list
+    # --------------------------------------------------------
 
-    if isinstance(value, tuple):
-        return [str(item) for item in value]
+    if isinstance(
+        value,
+        list
+    ):
 
-    if isinstance(value, str):
+        return [
+            str(item)
+            for item in value
+        ]
+
+    # --------------------------------------------------------
+    # Tuple
+    # --------------------------------------------------------
+
+    if isinstance(
+        value,
+        tuple
+    ):
+
+        return [
+            str(item)
+            for item in value
+        ]
+
+    # --------------------------------------------------------
+    # Dictionary
+    # --------------------------------------------------------
+
+    if isinstance(
+        value,
+        dict
+    ):
+
+        # Common context keys
+        for key in [
+            "context",
+            "contexts",
+            "documents",
+            "retrieved_contexts",
+            "chunks",
+        ]:
+
+            if key in value:
+
+                nested = value[key]
+
+                return prepare_context(
+                    nested
+                )
+
+        return [
+            json.dumps(
+                value,
+                ensure_ascii=False
+            )
+        ]
+
+    # --------------------------------------------------------
+    # String
+    # --------------------------------------------------------
+
+    if isinstance(
+        value,
+        str
+    ):
 
         text = value.strip()
 
-        # Try parsing Python-style list strings.
-        if text.startswith("[") and text.endswith("]"):
+        if not text:
+
+            return []
+
+        # ----------------------------------------------------
+        # Try JSON
+        # ----------------------------------------------------
+
+        if (
+            text.startswith("[")
+            and text.endswith("]")
+        ):
+
             try:
-                import ast
 
-                parsed = ast.literal_eval(text)
+                parsed = json.loads(
+                    text
+                )
 
-                if isinstance(parsed, list):
-                    return [str(item) for item in parsed]
+                if isinstance(
+                    parsed,
+                    list
+                ):
+
+                    return [
+                        str(item)
+                        for item in parsed
+                    ]
 
             except Exception:
+
                 pass
+
+        # ----------------------------------------------------
+        # Try Python literal
+        # ----------------------------------------------------
+
+        if (
+            text.startswith("[")
+            and text.endswith("]")
+        ):
+
+            try:
+
+                parsed = ast.literal_eval(
+                    text
+                )
+
+                if isinstance(
+                    parsed,
+                    list
+                ):
+
+                    return [
+                        str(item)
+                        for item in parsed
+                    ]
+
+            except Exception:
+
+                pass
+
+        # ----------------------------------------------------
+        # Normal text
+        # ----------------------------------------------------
 
         return [text]
 
-    return [str(value)]
+    # --------------------------------------------------------
+    # Other types
+    # --------------------------------------------------------
+
+    return [
+        str(value)
+    ]
+
+
+# ============================================================
+# GROUND TRUTH PREPARATION
+# ============================================================
+
+def prepare_ground_truth(value):
+    """
+    Convert ground truth into a single string.
+
+    Handles:
+
+        string
+        list
+        tuple
+        dictionary
+        JSON/Python list strings
+    """
+
+    value = clean_value(
+        value
+    )
+
+    if isinstance(
+        value,
+        list
+    ):
+
+        return " ".join(
+            str(item)
+            for item in value
+        )
+
+    if isinstance(
+        value,
+        tuple
+    ):
+
+        return " ".join(
+            str(item)
+            for item in value
+        )
+
+    if isinstance(
+        value,
+        dict
+    ):
+
+        return json.dumps(
+            value,
+            ensure_ascii=False
+        )
+
+    if isinstance(
+        value,
+        str
+    ):
+
+        text = value.strip()
+
+        if (
+            text.startswith("[")
+            and text.endswith("]")
+        ):
+
+            # Try JSON
+            try:
+
+                parsed = json.loads(
+                    text
+                )
+
+                if isinstance(
+                    parsed,
+                    list
+                ):
+
+                    return " ".join(
+                        str(item)
+                        for item in parsed
+                    )
+
+            except Exception:
+
+                pass
+
+            # Try Python literal
+            try:
+
+                parsed = ast.literal_eval(
+                    text
+                )
+
+                if isinstance(
+                    parsed,
+                    list
+                ):
+
+                    return " ".join(
+                        str(item)
+                        for item in parsed
+                    )
+
+            except Exception:
+
+                pass
+
+        return text
+
+    return str(value)
 
 
 # ============================================================
 # COLUMN MAPPING
 # ============================================================
 
-def get_ragas_column_mapping(df: pd.DataFrame) -> Dict:
+def get_ragas_column_mapping(
+    df: pd.DataFrame
+) -> Dict:
     """
-    Automatically detect the columns required for Ragas.
+    Detect the five-field AITrustEval schema.
+
+    Returns actual dataframe column names.
     """
 
-    validation = validate_dataset(df)
+    aliases = {
 
-    mapping = validation.get("mapping", {})
+        "question": [
+            "question",
+            "query",
+            "user_question",
+            "prompt",
+        ],
 
-    return {
-        "question": mapping.get("question"),
-        "answer": mapping.get("answer"),
-        "ground_truth": mapping.get("ground_truth"),
-        "context": mapping.get("context"),
+        "context": [
+            "context",
+            "contexts",
+            "retrieved_context",
+            "retrieved_contexts",
+        ],
+
+        "answer": [
+            "answer",
+            "response",
+            "model_answer",
+            "generated_answer",
+            "output",
+        ],
+
+        "ground_truth": [
+            "ground_truth",
+            "groundtruth",
+            "reference",
+            "reference_answer",
+            "expected_answer",
+        ],
+
     }
 
+    normalized = {
+
+        str(column)
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("-", "_"):
+        column
+
+        for column in df.columns
+    }
+
+    mapping = {}
+
+    for field, field_aliases in aliases.items():
+
+        mapping[field] = None
+
+        for alias in field_aliases:
+
+            alias_normalized = (
+                alias
+                .strip()
+                .lower()
+                .replace(" ", "_")
+                .replace("-", "_")
+            )
+
+            if (
+                alias_normalized
+                in normalized
+            ):
+
+                mapping[field] = (
+                    normalized[
+                        alias_normalized
+                    ]
+                )
+
+                break
+
+    return mapping
+
 
 # ============================================================
-# DATA PREPARATION
+# VALIDATE RAGAS MAPPING
 # ============================================================
 
-def prepare_ragas_dataset(
-    df: pd.DataFrame,
-    mapping: Dict,
-) -> EvaluationDataset:
+def validate_ragas_mapping(
+    mapping: Dict
+):
     """
-    Convert a normal dataframe into a Ragas EvaluationDataset.
+    Validate that all fields required by Ragas
+    are available.
     """
 
     required = [
@@ -190,7 +569,32 @@ def prepare_ragas_dataset(
         if not mapping.get(field)
     ]
 
-    if missing:
+    return (
+        len(missing) == 0,
+        missing
+    )
+
+
+# ============================================================
+# DATA PREPARATION
+# ============================================================
+
+def prepare_ragas_dataset(
+    df: pd.DataFrame,
+    mapping: Dict,
+) -> EvaluationDataset:
+    """
+    Convert dataframe into Ragas EvaluationDataset.
+    """
+
+    valid, missing = (
+        validate_ragas_mapping(
+            mapping
+        )
+    )
+
+    if not valid:
+
         raise ValueError(
             "Missing required Ragas fields: "
             + ", ".join(missing)
@@ -201,32 +605,49 @@ def prepare_ragas_dataset(
     for _, row in df.iterrows():
 
         sample = {
+
             "user_input": str(
                 clean_value(
-                    row[mapping["question"]]
+                    row[
+                        mapping["question"]
+                    ]
                 )
             ),
 
             "response": str(
                 clean_value(
-                    row[mapping["answer"]]
+                    row[
+                        mapping["answer"]
+                    ]
                 )
             ),
 
-            "reference": str(
-                clean_value(
-                    row[mapping["ground_truth"]]
+            "reference": (
+                prepare_ground_truth(
+                    row[
+                        mapping["ground_truth"]
+                    ]
                 )
             ),
 
-            "retrieved_contexts": prepare_context(
-                row[mapping["context"]]
+            "retrieved_contexts": (
+                prepare_context(
+                    row[
+                        mapping["context"]
+                    ]
+                )
             ),
         }
 
-        samples.append(sample)
+        samples.append(
+            sample
+        )
 
-    return EvaluationDataset.from_list(samples)
+    return (
+        EvaluationDataset.from_list(
+            samples
+        )
+    )
 
 
 # ============================================================
@@ -237,37 +658,53 @@ def create_local_llm(
     model: Optional[str] = None,
 ):
     """
-    Create a local Ragas LLM using Ollama.
+    Create the local Ragas LLM through Ollama.
 
     No cloud API is used.
     """
 
-    selected_model = select_llm_model(
-        model or DEFAULT_MODEL
+    selected_model = (
+        select_llm_model(
+            model
+            or DEFAULT_MODEL
+        )
     )
 
     if not selected_model:
+
         raise RuntimeError(
             "No local LLM model is available."
         )
 
     try:
+
         from openai import OpenAI
-        from ragas.llms import llm_factory
+        from ragas.llms import (
+            llm_factory
+        )
 
     except ImportError as exc:
+
         raise RuntimeError(
-            "Required Ragas/OpenAI components are unavailable."
+            "Required Ragas/OpenAI "
+            "components are unavailable."
         ) from exc
 
     client = OpenAI(
+
         api_key="ollama",
-        base_url="http://localhost:11434/v1",
+
+        base_url=(
+            "http://localhost:11434/v1"
+        ),
     )
 
     return llm_factory(
+
         selected_model,
+
         provider="openai",
+
         client=client,
     )
 
@@ -282,61 +719,140 @@ def run_ragas_evaluation(
     selected_metrics: Optional[list] = None,
 ) -> Dict:
     """
-    Run Ragas evaluation using the centralized Model Manager.
+    Run Ragas evaluation.
 
-    Parameters
-    ----------
-    df:
-        Input dataset.
-
-    model:
-        Optional preferred local LLM.
-
-    selected_metrics:
-        Optional list of metric names.
-
-    Returns
-    -------
-    dict
-        Standardized evaluation response.
+    Returns a standardized dictionary.
     """
 
-    environment = check_ragas_environment(model)
+    # --------------------------------------------------------
+    # Environment
+    # --------------------------------------------------------
 
-    if not environment["ragas_installed"]:
+    environment = (
+        check_ragas_environment(
+            model
+        )
+    )
+
+    # --------------------------------------------------------
+    # Ragas installed?
+    # --------------------------------------------------------
+
+    if not environment[
+        "ragas_installed"
+    ]:
+
         return {
-            "status": "unavailable",
-            "message": "Ragas is not installed.",
-            "environment": environment,
+
+            "status":
+                "unavailable",
+
+            "message":
+                "Ragas is not installed.",
+
+            "environment":
+                environment,
         }
 
-    if not environment["ollama_available"]:
+    # --------------------------------------------------------
+    # Ollama available?
+    # --------------------------------------------------------
+
+    if not environment[
+        "ollama_available"
+    ]:
+
         return {
-            "status": "unavailable",
+
+            "status":
+                "unavailable",
+
             "message": (
                 "Ollama is unavailable. "
-                "This is expected on the development laptop "
-                "if Ollama is not installed."
+                "This is expected on the "
+                "development laptop when "
+                "Ollama is not installed "
+                "or running."
             ),
-            "environment": environment,
+
+            "environment":
+                environment,
         }
 
-    if not environment["model_available"]:
+    # --------------------------------------------------------
+    # Model available?
+    # --------------------------------------------------------
+
+    if not environment[
+        "model_available"
+    ]:
+
         return {
-            "status": "unavailable",
+
+            "status":
+                "unavailable",
+
             "message": (
                 f"Selected local model "
-                f"'{environment['model']}' is unavailable."
+                f"'{environment['model']}' "
+                f"is unavailable."
             ),
-            "environment": environment,
+
+            "environment":
+                environment,
         }
 
-    mapping = get_ragas_column_mapping(df)
+    # --------------------------------------------------------
+    # Column mapping
+    # --------------------------------------------------------
+
+    mapping = (
+        get_ragas_column_mapping(
+            df
+        )
+    )
+
+    # --------------------------------------------------------
+    # Validate mapping
+    # --------------------------------------------------------
+
+    valid, missing = (
+        validate_ragas_mapping(
+            mapping
+        )
+    )
+
+    if not valid:
+
+        return {
+
+            "status":
+                "unavailable",
+
+            "message": (
+                "Missing required Ragas "
+                "fields: "
+                + ", ".join(missing)
+            ),
+
+            "mapping":
+                mapping,
+
+            "environment":
+                environment,
+        }
+
+    # --------------------------------------------------------
+    # Prepare and evaluate
+    # --------------------------------------------------------
 
     try:
-        evaluation_dataset = prepare_ragas_dataset(
-            df,
-            mapping,
+
+        evaluation_dataset = (
+            prepare_ragas_dataset(
+                df,
+                mapping
+            )
         )
 
         llm = create_local_llm(
@@ -344,23 +860,42 @@ def run_ragas_evaluation(
         )
 
         # ----------------------------------------------------
-        # Metric selection
+        # Metric objects
         # ----------------------------------------------------
 
         metric_objects = {
-            "faithfulness": Faithfulness(),
-            "answer_relevancy": AnswerRelevancy(),
-            "answer_correctness": AnswerCorrectness(),
-            "context_precision": ContextPrecision(),
-            "context_recall": ContextRecall(),
+
+            "faithfulness":
+                Faithfulness(),
+
+            "answer_relevancy":
+                AnswerRelevancy(),
+
+            "answer_correctness":
+                AnswerCorrectness(),
+
+            "context_precision":
+                ContextPrecision(),
+
+            "context_recall":
+                ContextRecall(),
         }
+
+        # ----------------------------------------------------
+        # Select metrics
+        # ----------------------------------------------------
 
         if selected_metrics:
 
             metrics = [
+
                 metric_objects[name]
-                for name in selected_metrics
-                if name in metric_objects
+
+                for name
+                in selected_metrics
+
+                if name
+                in metric_objects
             ]
 
         else:
@@ -369,22 +904,50 @@ def run_ragas_evaluation(
                 metric_objects.values()
             )
 
+        if not metrics:
+
+            return {
+
+                "status":
+                    "error",
+
+                "message":
+                    "No valid Ragas metrics were selected.",
+
+                "mapping":
+                    mapping,
+
+                "environment":
+                    environment,
+            }
+
         # ----------------------------------------------------
         # Run Ragas
         # ----------------------------------------------------
 
         result = evaluate(
+
             evaluation_dataset,
+
             metrics=metrics,
+
             llm=llm,
         )
 
-        # Convert result to dataframe when possible.
-        try:
-            result_df = result.to_pandas()
+        # ----------------------------------------------------
+        # Convert results
+        # ----------------------------------------------------
 
-            records = result_df.to_dict(
-                orient="records"
+        try:
+
+            result_df = (
+                result.to_pandas()
+            )
+
+            records = (
+                result_df.to_dict(
+                    orient="records"
+                )
             )
 
         except Exception:
@@ -392,30 +955,100 @@ def run_ragas_evaluation(
             result_df = None
             records = []
 
+        # ----------------------------------------------------
+        # Calculate summary
+        # ----------------------------------------------------
+
+        summary = {}
+
+        if result_df is not None:
+
+            for metric_name in [
+                "faithfulness",
+                "answer_relevancy",
+                "answer_correctness",
+                "context_precision",
+                "context_recall",
+            ]:
+
+                if (
+                    metric_name
+                    in result_df.columns
+                ):
+
+                    numeric_values = pd.to_numeric(
+                        result_df[
+                            metric_name
+                        ],
+                        errors="coerce"
+                    )
+
+                    if numeric_values.notna().any():
+
+                        summary[
+                            metric_name
+                        ] = float(
+                            numeric_values.mean()
+                        )
+
         return {
-            "status": "success",
-            "message": "Ragas evaluation completed.",
-            "model": environment["model"],
-            "embedding_model": environment[
-                "embedding_model"
-            ],
-            "mapping": mapping,
-            "metrics": records,
-            "raw_result": result,
-            "environment": environment,
+
+            "status":
+                "success",
+
+            "message":
+                "Ragas evaluation completed.",
+
+            "model":
+                environment["model"],
+
+            "embedding_model":
+                environment[
+                    "embedding_model"
+                ],
+
+            "mapping":
+                mapping,
+
+            "metrics":
+                records,
+
+            "summary":
+                summary,
+
+            "row_count":
+                len(df),
+
+            "raw_result":
+                result,
+
+            "environment":
+                environment,
         }
 
     except Exception as exc:
 
         return {
-            "status": "error",
-            "message": str(exc),
-            "model": environment["model"],
-            "embedding_model": environment[
-                "embedding_model"
-            ],
-            "mapping": mapping,
-            "environment": environment,
+
+            "status":
+                "error",
+
+            "message":
+                str(exc),
+
+            "model":
+                environment["model"],
+
+            "embedding_model":
+                environment[
+                    "embedding_model"
+                ],
+
+            "mapping":
+                mapping,
+
+            "environment":
+                environment,
         }
 
 
@@ -425,11 +1058,34 @@ def run_ragas_evaluation(
 
 if __name__ == "__main__":
 
-    print("=" * 60)
-    print("AITrustEval - Ragas Environment")
-    print("=" * 60)
+    DATASET_PATH = (
+        "data/sample/"
+        "synthetic_5field_dataset.csv"
+    )
 
-    environment = check_ragas_environment()
+    print(
+        "=" * 65
+    )
+
+    print(
+        "AITrustEval - Ragas Evaluation Test"
+    )
+
+    print(
+        "=" * 65
+    )
+
+    # --------------------------------------------------------
+    # Environment
+    # --------------------------------------------------------
+
+    print(
+        "\nChecking Ragas environment..."
+    )
+
+    environment = (
+        check_ragas_environment()
+    )
 
     print(
         f"\nRagas installed: "
@@ -461,9 +1117,17 @@ if __name__ == "__main__":
         f"{environment['ready']}"
     )
 
-    print("\nModel summary:")
+    # --------------------------------------------------------
+    # Model summary
+    # --------------------------------------------------------
 
-    summary = get_model_summary()
+    print(
+        "\nModel summary:"
+    )
+
+    summary = (
+        get_model_summary()
+    )
 
     print(
         f"  Configured/Detected LLMs: "
@@ -480,4 +1144,105 @@ if __name__ == "__main__":
         f"{summary['vision_count']}"
     )
 
-    print("\n" + "=" * 60)
+    # --------------------------------------------------------
+    # Load dataset
+    # --------------------------------------------------------
+
+    print(
+        "\nLoading dataset..."
+    )
+
+    df = pd.read_csv(
+        DATASET_PATH
+    )
+
+    print(
+        f"Rows: {len(df)}"
+    )
+
+    print(
+        f"Columns: {len(df.columns)}"
+    )
+
+    # --------------------------------------------------------
+    # Mapping
+    # --------------------------------------------------------
+
+    mapping = (
+        get_ragas_column_mapping(
+            df
+        )
+    )
+
+    print(
+        "\n========== COLUMN MAPPING =========="
+    )
+
+    for field, column in mapping.items():
+
+        print(
+            f"{field:<15} -> {column}"
+        )
+
+    # --------------------------------------------------------
+    # Run
+    # --------------------------------------------------------
+
+    print(
+        "\nRunning Ragas evaluation..."
+    )
+
+    results = (
+        run_ragas_evaluation(
+            df
+        )
+    )
+
+    # --------------------------------------------------------
+    # Result
+    # --------------------------------------------------------
+
+    print(
+        "\n========== RESULT =========="
+    )
+
+    print(
+        f"Status: "
+        f"{results.get('status')}"
+    )
+
+    print(
+        f"Message: "
+        f"{results.get('message')}"
+    )
+
+    if results.get(
+        "summary"
+    ):
+
+        print(
+            "\n========== SUMMARY =========="
+        )
+
+        for metric, score in (
+            results[
+                "summary"
+            ].items()
+        ):
+
+            print(
+                f"{metric:<25} -> "
+                f"{score:.4f}"
+            )
+
+    print(
+        "\n" + "=" * 65
+    )
+
+    print(
+        "RAGAS TEST COMPLETE"
+    )
+
+    print(
+        "=" * 65
+    )

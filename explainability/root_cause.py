@@ -1,204 +1,1214 @@
+"""
+AITrustEval - Root Cause Analysis
+
+Converts detected evaluation failures into:
+- probable root causes
+- possible contributing factors
+- recommendations
+
+This module is intentionally conservative.
+Root causes are preliminary analytical explanations,
+not definitive causal claims.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List
+
 import pandas as pd
 
 
-def determine_root_causes(row):
-    """
-    Determine likely root causes from failed evaluation metrics.
+# ============================================================
+# ROOT-CAUSE KNOWLEDGE BASE
+# ============================================================
 
-    This is a rule-based preliminary analysis.
-    It does not claim to establish the actual cause.
-    """
+ROOT_CAUSES = {
 
-    causes = []
-    recommendations = []
+    "unsupported_answer": {
+        "root_cause":
+            "The generated answer may contain claims that are not sufficiently supported by the retrieved context.",
 
-    failed_metrics = str(
-        row.get("failed_metrics", "")
+        "possible_sources": [
+            "Insufficient retrieved context",
+            "Irrelevant retrieved documents",
+            "Incomplete context coverage",
+            "Model generated unsupported information",
+        ],
+
+        "recommendation":
+            "Improve retrieval relevance and context coverage, then verify answer claims against retrieved evidence.",
+    },
+
+
+    "incorrect_answer": {
+        "root_cause":
+            "The generated answer may not sufficiently match the expected reference answer.",
+
+        "possible_sources": [
+            "Incorrect model reasoning",
+            "Incomplete context",
+            "Ambiguous question",
+            "Incorrect or incomplete reference information",
+        ],
+
+        "recommendation":
+            "Inspect the retrieved evidence and improve answer generation and grounding.",
+    },
+
+
+    "irrelevant_answer": {
+        "root_cause":
+            "The generated answer may not adequately address the user's question.",
+
+        "possible_sources": [
+            "Question-answer semantic mismatch",
+            "Weak prompt understanding",
+            "Insufficient question context",
+            "Model response drift",
+        ],
+
+        "recommendation":
+            "Improve question understanding and constrain answer generation to the requested information.",
+    },
+
+
+    "irrelevant_retrieval": {
+        "root_cause":
+            "Retrieved context may contain information that is not sufficiently relevant to the question.",
+
+        "possible_sources": [
+            "Weak retrieval query",
+            "Poor embedding representation",
+            "Incorrect ranking",
+            "Noisy knowledge base",
+        ],
+
+        "recommendation":
+            "Improve embedding quality, retrieval ranking and document filtering.",
+    },
+
+
+    "missing_information": {
+        "root_cause":
+            "Relevant information may not have been retrieved or may be missing from the available context.",
+
+        "possible_sources": [
+            "Retrieval miss",
+            "Incomplete knowledge base",
+            "Low recall",
+            "Insufficient retrieval depth",
+        ],
+
+        "recommendation":
+            "Increase retrieval coverage and investigate missing or incorrectly indexed documents.",
+    },
+
+
+    "late_relevant_retrieval": {
+        "root_cause":
+            "Relevant information may appear too low in the retrieval ranking.",
+
+        "possible_sources": [
+            "Poor ranking model",
+            "Embedding mismatch",
+            "Weak query-document similarity",
+            "Noisy top-ranked results",
+        ],
+
+        "recommendation":
+            "Improve ranking quality and evaluate retrieval at multiple K values.",
+    },
+
+
+    "poor_ranking": {
+        "root_cause":
+            "Relevant information may be present but incorrectly ordered in the retrieved results.",
+
+        "possible_sources": [
+            "Ranking model weakness",
+            "Embedding similarity limitations",
+            "Duplicate or noisy documents",
+            "Incorrect relevance estimation",
+        ],
+
+        "recommendation":
+            "Tune retrieval ranking and evaluate the ordering of relevant documents.",
+    },
+
+
+    "retrieval_miss": {
+        "root_cause":
+            "No sufficiently relevant retrieved item was detected within the evaluated retrieval depth.",
+
+        "possible_sources": [
+            "Low retrieval recall",
+            "Missing document",
+            "Poor query representation",
+            "Embedding mismatch",
+        ],
+
+        "recommendation":
+            "Improve retrieval recall and verify that the required information exists in the knowledge base.",
+    },
+
+
+    "metric_failure": {
+        "root_cause":
+            "The evaluated metric indicates a potential quality issue that requires further investigation.",
+
+        "possible_sources": [
+            "Data quality issue",
+            "Model behavior",
+            "Evaluation methodology",
+            "Insufficient evaluation evidence",
+        ],
+
+        "recommendation":
+            "Inspect the individual sample, supporting evidence and evaluation methodology before making a final conclusion.",
+    },
+}
+
+
+# ============================================================
+# METRIC → FAILURE TYPE
+# ============================================================
+
+METRIC_FAILURE_MAP = {
+
+    "faithfulness":
+        "unsupported_answer",
+
+    "answer_correctness":
+        "incorrect_answer",
+
+    "correctness":
+        "incorrect_answer",
+
+    "answer_relevancy":
+        "irrelevant_answer",
+
+    "relevancy":
+        "irrelevant_answer",
+
+    "context_precision":
+        "irrelevant_retrieval",
+
+    "precision":
+        "irrelevant_retrieval",
+
+    "precision@5":
+        "irrelevant_retrieval",
+
+    "context_recall":
+        "missing_information",
+
+    "recall":
+        "missing_information",
+
+    "recall@5":
+        "missing_information",
+
+    "mrr":
+        "late_relevant_retrieval",
+
+    "ndcg":
+        "poor_ranking",
+
+    "ndcg@5":
+        "poor_ranking",
+
+    "hit_rate":
+        "retrieval_miss",
+
+    "hit_rate@5":
+        "retrieval_miss",
+
+    "context_answer_similarity":
+        "unsupported_answer",
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _normalize_metric_name(
+    metric: Any,
+) -> str:
+
+    return (
+        str(metric)
+        .strip()
+        .lower()
+        .replace(" ", "_")
     )
 
-    failure_count = int(
-        row.get("failure_count", 0)
+
+def _as_list(
+    value: Any,
+) -> List[Any]:
+
+    if value is None:
+
+        return []
+
+    if isinstance(
+        value,
+        list,
+    ):
+
+        return value
+
+    if isinstance(
+        value,
+        tuple,
+    ):
+
+        return list(value)
+
+    if isinstance(
+        value,
+        set,
+    ):
+
+        return list(value)
+
+    if isinstance(
+        value,
+        str,
+    ):
+
+        if not value.strip():
+
+            return []
+
+        return [
+            value
+        ]
+
+    return [
+        value
+    ]
+
+
+def _safe_score(
+    value: Any,
+):
+
+    try:
+
+        number = float(
+            value
+        )
+
+        if pd.isna(
+            number
+        ):
+
+            return None
+
+        return number
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# SCORE → FAILURE TYPE
+# ============================================================
+
+def identify_failure_type(
+    metric: Any,
+    score: Any = None,
+) -> str:
+
+    normalized = (
+        _normalize_metric_name(
+            metric
+        )
     )
 
-    # --------------------------------------------------
-    # Answer Relevancy
-    # --------------------------------------------------
 
-    if "answer_relevancy" in failed_metrics:
+    if normalized in METRIC_FAILURE_MAP:
 
-        causes.append(
-            "Generated answer may not directly address "
-            "the user's question."
-        )
+        return METRIC_FAILURE_MAP[
+            normalized
+        ]
 
-        recommendations.append(
-            "Review the generated answer for question alignment."
-        )
 
-    # --------------------------------------------------
-    # Answer Correctness
-    # --------------------------------------------------
+    # Handle variations such as:
+    # answer_correctness_score
+    # precision_at_5
+    # recall_at_5
 
-    if "answer_correctness" in failed_metrics:
+    if (
+        "correctness"
+        in normalized
+    ):
 
-        causes.append(
-            "Generated answer may differ from the "
-            "reference answer."
-        )
+        return "incorrect_answer"
 
-        recommendations.append(
-            "Compare the generated answer with the reference answer."
-        )
 
-    # --------------------------------------------------
-    # Context Alignment
-    # --------------------------------------------------
+    if (
+        "relevancy"
+        in normalized
+        or "relevance"
+        in normalized
+    ):
 
-    if "context_answer_similarity" in failed_metrics:
+        return "irrelevant_answer"
 
-        causes.append(
-            "Generated answer may have weak alignment "
-            "with the available context."
-        )
 
-        recommendations.append(
-            "Check whether the retrieved context contains "
-            "the information required to answer the question."
-        )
+    if (
+        "faithfulness"
+        in normalized
+    ):
 
-    # --------------------------------------------------
-    # Multiple failures
-    # --------------------------------------------------
+        return "unsupported_answer"
 
-    if failure_count >= 3:
 
-        causes.append(
-            "Multiple quality indicators failed simultaneously."
-        )
+    if (
+        "precision"
+        in normalized
+    ):
 
-        recommendations.append(
-            "Perform detailed sample-level investigation "
-            "before drawing conclusions."
-        )
+        return "irrelevant_retrieval"
 
-    elif failure_count >= 2:
 
-        causes.append(
-            "More than one quality indicator requires investigation."
-        )
+    if (
+        "recall"
+        in normalized
+    ):
 
-    # --------------------------------------------------
-    # No failure
-    # --------------------------------------------------
+        return "missing_information"
 
-    if not causes:
 
-        causes.append(
-            "No rule-based failure cause identified."
-        )
+    if (
+        "mrr"
+        in normalized
+    ):
 
-    if not recommendations:
+        return "late_relevant_retrieval"
 
-        recommendations.append(
-            "No immediate investigation recommendation."
-        )
 
-    return {
-        "root_cause": " ".join(causes),
-        "recommendation": " ".join(
-            recommendations
-        ),
+    if (
+        "ndcg"
+        in normalized
+    ):
+
+        return "poor_ranking"
+
+
+    if (
+        "hit"
+        in normalized
+    ):
+
+        return "retrieval_miss"
+
+
+    return "metric_failure"
+
+
+# ============================================================
+# ROOT CAUSE LOOKUP
+# ============================================================
+
+def get_root_cause(
+    failure_type: str,
+) -> Dict[str, Any]:
+
+    return ROOT_CAUSES.get(
+        failure_type,
+        ROOT_CAUSES[
+            "metric_failure"
+        ],
+    )
+
+
+def analyze_root_cause(
+    failure_type: str,
+    metric: Any = None,
+    score: Any = None,
+) -> Dict[str, Any]:
+
+    failure_type = (
+        failure_type
+        or "metric_failure"
+    )
+
+
+    information = get_root_cause(
+        failure_type
+    )
+
+
+    result = {
+
+        "failure_type":
+            failure_type,
+
+        "metric":
+            metric,
+
+        "score":
+            score,
+
+        "root_cause":
+            information[
+                "root_cause"
+            ],
+
+        "possible_sources":
+            information[
+                "possible_sources"
+            ],
+
+        "recommendation":
+            information[
+                "recommendation"
+            ],
     }
 
 
-def generate_root_cause_report(failure_df):
-    """
-    Add root-cause and recommendation fields
-    to the failure analysis dataframe.
-    """
+    return result
 
-    if failure_df.empty:
-        return failure_df.copy()
 
-    output = failure_df.copy()
+# ============================================================
+# MULTIPLE ROOT CAUSES
+# ============================================================
 
-    root_causes = []
+def analyze_root_causes(
+    failures: Iterable[Any],
+) -> List[Dict[str, Any]]:
+
+    results = []
+
+
+    for failure in failures:
+
+        if isinstance(
+            failure,
+            dict,
+        ):
+
+            metric = failure.get(
+                "metric"
+            )
+
+            score = failure.get(
+                "score"
+            )
+
+            failure_type = failure.get(
+                "failure_type"
+            )
+
+
+        else:
+
+            metric = str(
+                failure
+            )
+
+            score = None
+
+            failure_type = None
+
+
+        if not failure_type:
+
+            failure_type = (
+                identify_failure_type(
+                    metric,
+                    score,
+                )
+            )
+
+
+        results.append(
+            analyze_root_cause(
+                failure_type=
+                    failure_type,
+
+                metric=
+                    metric,
+
+                score=
+                    score,
+            )
+        )
+
+
+    return results
+
+
+# ============================================================
+# ROOT CAUSE SUMMARY
+# ============================================================
+
+def summarize_root_causes(
+    analyses: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+
+    if not analyses:
+
+        return {
+            "total":
+                0,
+
+            "root_causes":
+                {},
+
+            "recommendations":
+                [],
+        }
+
+
+    counts = {}
+
     recommendations = []
 
-    for _, row in output.iterrows():
 
-        analysis = determine_root_causes(row)
+    for analysis in analyses:
 
-        root_causes.append(
-            analysis["root_cause"]
+        failure_type = (
+            analysis.get(
+                "failure_type",
+                "metric_failure",
+            )
         )
 
-        recommendations.append(
-            analysis["recommendation"]
+
+        counts[
+            failure_type
+        ] = (
+            counts.get(
+                failure_type,
+                0,
+            )
+            + 1
         )
 
-    output["root_cause"] = root_causes
-    output["recommendation"] = recommendations
 
-    return output
+        recommendation = (
+            analysis.get(
+                "recommendation"
+            )
+        )
 
+
+        if (
+            recommendation
+            and recommendation
+            not in recommendations
+        ):
+
+            recommendations.append(
+                recommendation
+            )
+
+
+    return {
+
+        "total":
+            len(analyses),
+
+        "root_causes":
+            counts,
+
+        "recommendations":
+            recommendations,
+    }
+
+
+# ============================================================
+# FAILURE DATAFRAME NORMALIZATION
+# ============================================================
+
+def _extract_failed_metrics(
+    row: pd.Series,
+) -> List[str]:
+
+    # Preferred format:
+    # failed_metrics = [...]
+    if "failed_metrics" in row.index:
+
+        metrics = _as_list(
+            row.get(
+                "failed_metrics"
+            )
+        )
+
+
+        if metrics:
+
+            return [
+                str(metric)
+                for metric in metrics
+            ]
+
+
+    # Alternative format:
+    # failure_metrics = [...]
+    if "failure_metrics" in row.index:
+
+        metrics = _as_list(
+            row.get(
+                "failure_metrics"
+            )
+        )
+
+
+        if metrics:
+
+            return [
+                str(metric)
+                for metric in metrics
+            ]
+
+
+    # Single metric column.
+    if "metric" in row.index:
+
+        metric = row.get(
+            "metric"
+        )
+
+
+        if metric is not None:
+
+            return [
+                str(metric)
+            ]
+
+
+    # Some failure-analysis implementations
+    # may store failed metric names under
+    # "failures".
+
+    if "failures" in row.index:
+
+        metrics = _as_list(
+            row.get(
+                "failures"
+            )
+        )
+
+
+        if metrics:
+
+            return [
+                str(metric)
+                for metric in metrics
+            ]
+
+
+    return []
+
+
+# ============================================================
+# GENERATE ROOT-CAUSE REPORT
+# ============================================================
+
+def generate_root_cause_report(
+    failures_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Convert failure-analysis output into a
+    dashboard-ready root-cause report.
+
+    Expected output columns:
+
+    - id
+    - severity
+    - failed_metrics
+    - failure_count
+    - root_cause
+    - recommendation
+    """
+
+    if failures_df is None:
+
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "severity",
+                "failed_metrics",
+                "failure_count",
+                "root_cause",
+                "recommendation",
+            ]
+        )
+
+
+    if not isinstance(
+        failures_df,
+        pd.DataFrame,
+    ):
+
+        try:
+
+            failures_df = pd.DataFrame(
+                failures_df
+            )
+
+        except Exception:
+
+            return pd.DataFrame()
+
+
+    if failures_df.empty:
+
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "severity",
+                "failed_metrics",
+                "failure_count",
+                "root_cause",
+                "recommendation",
+            ]
+        )
+
+
+    report_rows = []
+
+
+    for index, row in (
+        failures_df.iterrows()
+    ):
+
+        # ----------------------------------------------------
+        # ID
+        # ----------------------------------------------------
+
+        sample_id = row.get(
+            "id",
+            index + 1,
+        )
+
+
+        # ----------------------------------------------------
+        # SEVERITY
+        # ----------------------------------------------------
+
+        severity = row.get(
+            "severity",
+            "Low",
+        )
+
+
+        if severity is None:
+
+            severity = "Low"
+
+
+        severity = str(
+            severity
+        ).title()
+
+
+        # ----------------------------------------------------
+        # FAILED METRICS
+        # ----------------------------------------------------
+
+        failed_metrics = (
+            _extract_failed_metrics(
+                row
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # FALLBACK
+        # ----------------------------------------------------
+
+        if not failed_metrics:
+
+            # Look for known metric columns
+            # containing numeric low scores.
+
+            known_metrics = [
+                "answer_relevancy",
+                "answer_correctness",
+                "context_answer_similarity",
+                "faithfulness",
+                "context_precision",
+                "context_recall",
+                "precision@5",
+                "recall@5",
+                "mrr",
+                "ndcg@5",
+                "hit_rate@5",
+            ]
+
+
+            for metric in (
+                known_metrics
+            ):
+
+                if metric not in row.index:
+
+                    continue
+
+
+                score = _safe_score(
+                    row.get(
+                        metric
+                    )
+                )
+
+
+                if (
+                    score is not None
+                    and score < 0.50
+                ):
+
+                    failed_metrics.append(
+                        metric
+                    )
+
+
+        # ----------------------------------------------------
+        # ROOT CAUSE
+        # ----------------------------------------------------
+
+        root_causes = []
+
+
+        recommendations_for_row = []
+
+
+        for metric in (
+            failed_metrics
+        ):
+
+            failure_type = (
+                identify_failure_type(
+                    metric
+                )
+            )
+
+
+            analysis = (
+                analyze_root_cause(
+                    failure_type=
+                        failure_type,
+
+                    metric=
+                        metric,
+
+                    score=
+                        row.get(
+                            metric
+                        )
+                        if metric
+                        in row.index
+                        else None,
+                )
+            )
+
+
+            root_causes.append(
+                analysis[
+                    "root_cause"
+                ]
+            )
+
+
+            recommendation = (
+                analysis[
+                    "recommendation"
+                ]
+            )
+
+
+            if (
+                recommendation
+                and recommendation
+                not in recommendations_for_row
+            ):
+
+                recommendations_for_row.append(
+                    recommendation
+                )
+
+
+        # ----------------------------------------------------
+        # NO FAILURE INFORMATION
+        # ----------------------------------------------------
+
+        if not root_causes:
+
+            root_causes.append(
+                "The available failure record does not contain enough metric-level information to determine a specific root cause."
+            )
+
+
+        if not recommendations_for_row:
+
+            recommendations_for_row.append(
+                "Inspect the sample-level evidence and evaluation criteria before making a final conclusion."
+            )
+
+
+        report_rows.append(
+            {
+                "id":
+                    sample_id,
+
+                "severity":
+                    severity,
+
+                "failed_metrics":
+                    ", ".join(
+                        failed_metrics
+                    )
+                    if failed_metrics
+                    else "Not Available",
+
+                "failure_count":
+                    len(
+                        failed_metrics
+                    ),
+
+                "root_cause":
+                    " | ".join(
+                        dict.fromkeys(
+                            root_causes
+                        )
+                    ),
+
+                "recommendation":
+                    " | ".join(
+                        dict.fromkeys(
+                            recommendations_for_row
+                        )
+                    ),
+            }
+        )
+
+
+    return pd.DataFrame(
+        report_rows
+    )
+
+
+# ============================================================
+# COMPLETE ROOT-CAUSE ANALYSIS
+# ============================================================
+
+def generate_root_cause_analysis(
+    failures_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """
+    Generate a structured root-cause analysis payload.
+    """
+
+    report_df = (
+        generate_root_cause_report(
+            failures_df
+        )
+    )
+
+
+    if report_df.empty:
+
+        return {
+            "status":
+                "completed",
+
+            "total_samples":
+                0,
+
+            "report":
+                report_df,
+
+            "summary": {
+                "total":
+                    0,
+
+                "root_causes":
+                    {},
+
+                "recommendations":
+                    [],
+            },
+        }
+
+
+    analyses = []
+
+
+    for _, row in (
+        report_df.iterrows()
+    ):
+
+        metrics = _as_list(
+            row.get(
+                "failed_metrics"
+            )
+        )
+
+
+        if isinstance(
+            row.get(
+                "failed_metrics"
+            ),
+            str,
+        ):
+
+            metrics = [
+                metric.strip()
+                for metric in
+                row[
+                    "failed_metrics"
+                ].split(",")
+                if metric.strip()
+            ]
+
+
+        for metric in metrics:
+
+            failure_type = (
+                identify_failure_type(
+                    metric
+                )
+            )
+
+
+            analyses.append(
+                analyze_root_cause(
+                    failure_type=
+                        failure_type,
+
+                    metric=
+                        metric,
+                )
+            )
+
+
+    summary = (
+        summarize_root_causes(
+            analyses
+        )
+    )
+
+
+    return {
+
+        "status":
+            "completed",
+
+        "total_samples":
+            len(report_df),
+
+        "report":
+            report_df,
+
+        "analyses":
+            analyses,
+
+        "summary":
+            summary,
+    }
+
+
+# ============================================================
+# CLI TEST
+# ============================================================
 
 if __name__ == "__main__":
 
     print(
-        "========== ROOT CAUSE ANALYSIS TEST =========="
-    )
-
-    input_file = (
-        "outputs/results/"
-        "unified_evaluation_results.csv"
-    )
-
-    df = pd.read_csv(input_file)
-
-    # Import failure analysis
-    from explainability.failure_analysis import (
-        analyze_failures,
-    )
-
-    failures = analyze_failures(df)
-
-    report = generate_root_cause_report(
-        failures
+        "=" * 70
     )
 
     print(
-        f"\nSamples requiring investigation: "
-        f"{len(report)}"
+        "AITrustEval - Root Cause Analysis Test"
     )
 
     print(
-        "\n========== ROOT CAUSE FINDINGS =========="
+        "=" * 70
     )
 
-    if report.empty:
 
-        print(
-            "No failures identified."
-        )
+    sample_failures = pd.DataFrame(
+        [
+            {
+                "id":
+                    1,
 
-    else:
+                "severity":
+                    "High",
 
-        # Show a compact version first
-        display_columns = [
-            "id",
-            "failed_metrics",
-            "severity",
-            "root_cause",
-            "recommendation",
+                "failed_metrics":
+                    [
+                        "answer_correctness",
+                        "answer_relevancy",
+                    ],
+            },
+
+            {
+                "id":
+                    2,
+
+                "severity":
+                    "Medium",
+
+                "failed_metrics":
+                    [
+                        "precision@5",
+                        "mrr",
+                    ],
+            },
+
+            {
+                "id":
+                    3,
+
+                "severity":
+                    "Low",
+
+                "failed_metrics":
+                    [
+                        "ndcg@5",
+                    ],
+            },
         ]
+    )
 
-        print(
-            report[
-                display_columns
-            ].to_string(index=False)
+
+    report = (
+        generate_root_cause_report(
+            sample_failures
         )
+    )
+
 
     print(
-        "\n========== TEST COMPLETE =========="
+        "\nRoot-Cause Report:"
+    )
+
+
+    print(
+        report.to_string(
+            index=False
+        )
+    )
+
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "Root Cause Analysis Test Complete"
+    )
+
+    print(
+        "=" * 70
     )

@@ -1,219 +1,511 @@
-import pandas as pd
+# ============================================================
+# AITrustEval - Failure Analysis
+# ============================================================
+
+from typing import Any, Dict, List, Optional
 
 
-DEFAULT_THRESHOLD = 0.40
+# ============================================================
+# SCORE STATUS
+# ============================================================
 
-
-def classify_score(score, threshold=DEFAULT_THRESHOLD):
+def classify_score(
+    score: Optional[float],
+    good_threshold: float = 0.75,
+    warning_threshold: float = 0.50,
+) -> str:
     """
-    Classify an evaluation score.
-
-    These categories are intended for analysis,
-    not as formal pass/fail certification limits.
-    """
-
-    if score < threshold:
-        return "Needs Investigation"
-
-    return "Acceptable"
-
-
-def analyze_failures(
-    results_df,
-    thresholds=None,
-):
-    """
-    Identify low-scoring samples.
-
-    Parameters
-    ----------
-    results_df : pandas.DataFrame
-        Sample-level evaluation results.
-
-    thresholds : dict, optional
-        Metric-specific investigation thresholds.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Failure analysis results.
+    Convert a metric score into a human-readable status.
     """
 
-    if thresholds is None:
-        thresholds = {
-            "answer_relevancy": 0.40,
-            "answer_correctness": 0.40,
-            "context_answer_similarity": 0.40,
-        }
+    if score is None:
+        return "unavailable"
 
-    analysis_rows = []
+    if score >= good_threshold:
+        return "good"
 
-    score_columns = [
-        column
-        for column in results_df.columns
-        if column in thresholds
-    ]
+    if score >= warning_threshold:
+        return "warning"
 
-    for _, row in results_df.iterrows():
-
-        sample_id = row["id"]
-
-        failed_metrics = []
-        scores = {}
-
-        for metric in score_columns:
-
-            score = float(row[metric])
-
-            scores[metric] = score
-
-            if score < thresholds[metric]:
-                failed_metrics.append(metric)
-
-        if failed_metrics:
-
-            severity = determine_severity(
-                len(failed_metrics),
-                len(score_columns),
-            )
-
-            analysis_rows.append(
-                {
-                    "id": sample_id,
-                    "failed_metrics": ", ".join(
-                        failed_metrics
-                    ),
-                    "failure_count": len(
-                        failed_metrics
-                    ),
-                    "severity": severity,
-                    **scores,
-                }
-            )
-
-    return pd.DataFrame(analysis_rows)
+    return "poor"
 
 
-def determine_severity(
-    failure_count,
-    total_metrics,
-):
+# ============================================================
+# FAILURE TYPE
+# ============================================================
+
+def identify_failure_type(
+    metric: str,
+    score: Optional[float],
+) -> Optional[str]:
     """
-    Assign a simple investigation severity.
-
-    This is an analytical classification and
-    should not be interpreted as a security rating.
+    Identify the general failure category for a metric.
     """
 
-    if total_metrics == 0:
-        return "Unknown"
+    if score is None:
+        return None
 
-    failure_ratio = (
-        failure_count / total_metrics
-    )
+    if score >= 0.75:
+        return None
 
-    if failure_ratio >= 0.75:
-        return "High"
+    metric = metric.lower()
 
-    if failure_ratio >= 0.50:
-        return "Medium"
+    if "faithfulness" in metric:
+        return "unsupported_answer"
 
-    return "Low"
+    if "correctness" in metric:
+        return "incorrect_answer"
+
+    if "relevancy" in metric:
+        return "irrelevant_answer"
+
+    if "precision" in metric:
+        return "irrelevant_retrieval"
+
+    if "recall" in metric:
+        return "missing_information"
+
+    if "ndcg" in metric:
+        return "poor_ranking"
+
+    if "mrr" in metric:
+        return "late_relevant_retrieval"
+
+    if "hit_rate" in metric:
+        return "retrieval_miss"
+
+    return "metric_failure"
 
 
-def summarize_failures(failure_df):
+# ============================================================
+# FAILURE DESCRIPTION
+# ============================================================
+
+def describe_failure(
+    failure_type: Optional[str],
+) -> str:
     """
-    Generate summary statistics for failures.
+    Explain what a failure type means.
     """
 
-    if failure_df.empty:
+    descriptions = {
 
-        return {
-            "total_failures": 0,
-            "high": 0,
-            "medium": 0,
-            "low": 0,
-        }
-
-    return {
-        "total_failures": len(failure_df),
-        "high": int(
+        "unsupported_answer":
             (
-                failure_df["severity"]
-                == "High"
-            ).sum()
-        ),
-        "medium": int(
+                "The generated answer contains information "
+                "that is not sufficiently supported by the "
+                "retrieved context."
+            ),
+
+        "incorrect_answer":
             (
-                failure_df["severity"]
-                == "Medium"
-            ).sum()
-        ),
-        "low": int(
+                "The generated answer differs from the "
+                "expected ground-truth answer."
+            ),
+
+        "irrelevant_answer":
             (
-                failure_df["severity"]
-                == "Low"
-            ).sum()
-        ),
+                "The generated answer does not sufficiently "
+                "address the user's question."
+            ),
+
+        "irrelevant_retrieval":
+            (
+                "The retrieved context contains information "
+                "that is not sufficiently relevant to the "
+                "ground truth."
+            ),
+
+        "missing_information":
+            (
+                "Relevant information required to answer "
+                "the question was not sufficiently retrieved."
+            ),
+
+        "poor_ranking":
+            (
+                "Relevant information exists but is not ranked "
+                "in an optimal position."
+            ),
+
+        "late_relevant_retrieval":
+            (
+                "The first relevant context appears at a "
+                "relatively late retrieval position."
+            ),
+
+        "retrieval_miss":
+            (
+                "No sufficiently relevant context was found "
+                "within the evaluated top-K results."
+            ),
+
+        "metric_failure":
+            (
+                "The metric score is below the expected "
+                "quality threshold."
+            ),
     }
 
+    return descriptions.get(
+        failure_type,
+        "The metric did not meet the expected quality level.",
+    )
+
+
+# ============================================================
+# FAILURE ANALYSIS FOR ONE RESULT
+# ============================================================
+
+def analyze_metric(
+    metric: str,
+    score: Optional[float],
+) -> Dict[str, Any]:
+    """
+    Analyze a single metric result.
+    """
+
+    status = classify_score(
+        score
+    )
+
+    failure_type = identify_failure_type(
+        metric,
+        score,
+    )
+
+    return {
+
+        "metric": metric,
+
+        "score": score,
+
+        "status": status,
+
+        "failure_type": failure_type,
+
+        "description":
+            describe_failure(
+                failure_type
+            )
+            if failure_type
+            else "Metric is performing within the expected range.",
+    }
+
+
+# ============================================================
+# ANALYZE METRIC DICTIONARY
+# ============================================================
+
+def analyze_metrics(
+    metrics: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Analyze a dictionary of metric scores.
+    """
+
+    results = []
+
+    for metric, score in metrics.items():
+
+        # Ignore non-numeric values
+        if score is None:
+            results.append(
+                analyze_metric(
+                    metric,
+                    None,
+                )
+            )
+            continue
+
+        try:
+
+            numeric_score = float(
+                score
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            continue
+
+        results.append(
+            analyze_metric(
+                metric,
+                numeric_score,
+            )
+        )
+
+    return results
+
+
+# ============================================================
+# FAILED METRICS
+# ============================================================
+
+def get_failed_metrics(
+    analyses: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Return metrics classified as warning or poor.
+    """
+
+    return [
+
+        result
+
+        for result in analyses
+
+        if result.get(
+            "status"
+        )
+        in (
+            "warning",
+            "poor",
+        )
+    ]
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+def summarize_failures(
+    analyses: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Generate an overall failure summary.
+    """
+
+    total = len(
+        analyses
+    )
+
+    good = sum(
+
+        1
+
+        for result in analyses
+
+        if result.get(
+            "status"
+        ) == "good"
+    )
+
+    warning = sum(
+
+        1
+
+        for result in analyses
+
+        if result.get(
+            "status"
+        ) == "warning"
+    )
+
+    poor = sum(
+
+        1
+
+        for result in analyses
+
+        if result.get(
+            "status"
+        ) == "poor"
+    )
+
+    unavailable = sum(
+
+        1
+
+        for result in analyses
+
+        if result.get(
+            "status"
+        ) == "unavailable"
+    )
+
+    return {
+
+        "total_metrics":
+            total,
+
+        "good":
+            good,
+
+        "warning":
+            warning,
+
+        "poor":
+            poor,
+
+        "unavailable":
+            unavailable,
+
+        "failed_metrics":
+            warning + poor,
+    }
+
+
+# ============================================================
+# COMPLETE FAILURE ANALYSIS
+# ============================================================
+
+def analyze_failures(
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Complete failure analysis pipeline.
+    """
+
+    analyses = analyze_metrics(
+        metrics
+    )
+
+    failed = get_failed_metrics(
+        analyses
+    )
+
+    summary = summarize_failures(
+        analyses
+    )
+
+    return {
+
+        "analyses":
+            analyses,
+
+        "failed_metrics":
+            failed,
+
+        "summary":
+            summary,
+    }
+
+
+# ============================================================
+# CLI TEST
+# ============================================================
 
 if __name__ == "__main__":
 
     print(
-        "========== FAILURE ANALYSIS TEST =========="
-    )
-
-    input_file = (
-        "outputs/results/"
-        "unified_evaluation_results.csv"
-    )
-
-    df = pd.read_csv(input_file)
-
-    failures = analyze_failures(df)
-
-    summary = summarize_failures(
-        failures
-    )
-
-    print("\nFailure Summary:")
-
-    print(
-        f"Total failures: "
-        f"{summary['total_failures']}"
+        "=" * 65
     )
 
     print(
-        f"High: {summary['high']}"
+        "AITrustEval - Failure Analysis Test"
     )
 
     print(
-        f"Medium: {summary['medium']}"
+        "=" * 65
+    )
+
+    test_metrics = {
+
+        "faithfulness":
+            0.42,
+
+        "answer_correctness":
+            0.81,
+
+        "answer_relevancy":
+            0.63,
+
+        "precision@5":
+            0.45,
+
+        "recall@5":
+            0.90,
+
+        "mrr":
+            0.38,
+
+        "ndcg@5":
+            0.72,
+
+        "hit_rate@5":
+            0.95,
+    }
+
+    results = analyze_failures(
+        test_metrics
     )
 
     print(
-        f"Low: {summary['low']}"
+        "\n========== METRIC ANALYSIS =========="
     )
 
-    print(
-        "\n========== FAILED SAMPLES =========="
-    )
-
-    if failures.empty:
+    for result in results[
+        "analyses"
+    ]:
 
         print(
-            "No samples require investigation."
+            f"\nMetric: "
+            f"{result['metric']}"
         )
 
-    else:
+        print(
+            f"Score: "
+            f"{result['score']}"
+        )
 
         print(
-            failures.to_string(
-                index=False
-            )
+            f"Status: "
+            f"{result['status']}"
+        )
+
+        print(
+            f"Failure type: "
+            f"{result['failure_type']}"
+        )
+
+        print(
+            f"Description: "
+            f"{result['description']}"
         )
 
     print(
-        "\n========== TEST COMPLETE =========="
+        "\n========== SUMMARY =========="
+    )
+
+    for key, value in (
+        results[
+            "summary"
+        ].items()
+    ):
+
+        print(
+            f"{key}: {value}"
+        )
+
+    print(
+        "\n========== FAILED METRICS =========="
+    )
+
+    for result in (
+        results[
+            "failed_metrics"
+        ]
+    ):
+
+        print(
+            f"{result['metric']}: "
+            f"{result['score']} "
+            f"-> "
+            f"{result['failure_type']}"
+        )
+
+    print(
+        "\n" + "=" * 65
+    )
+
+    print(
+        "FAILURE ANALYSIS TEST COMPLETE"
+    )
+
+    print(
+        "=" * 65
     )

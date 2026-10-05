@@ -1,55 +1,101 @@
 import pandas as pd
 
 
-# Possible names that datasets may use for each field.
-COLUMN_ALIASES = {
+# ============================================================
+# FIELD ALIASES
+# ============================================================
+
+FIELD_ALIASES = {
+
     "question": [
         "question",
+        "questions",
         "query",
+        "queries",
         "user_query",
         "user_question",
         "prompt",
         "input",
+        "user_input"
     ],
-    "answer": [
-        "answer",
-        "response",
-        "generated_answer",
-        "model_answer",
-        "output",
-    ],
-    "ground_truth": [
-    "ground_truth",
-    "ground_truths",
-    "groundtruth",
-    "groundtruths",
-    "reference",
-    "references",
-    "reference_answer",
-    "expected_answer",
-    "correct_answer",
-  ],
+
     "context": [
         "context",
         "contexts",
         "retrieved_context",
         "retrieved_contexts",
+        "retrieved_contexts",
         "documents",
         "document",
+        "retrieval_context",
+        "retrieval_contexts"
     ],
+
+    "answer": [
+        "answer",
+        "answers",
+        "response",
+        "responses",
+        "generated_answer",
+        "model_answer",
+        "assistant_answer",
+        "output"
+    ],
+
+    "ground_truth": [
+        "ground_truth",
+        "ground_truths",
+        "groundtruth",
+        "groundtruths",
+        "reference",
+        "references",
+        "reference_answer",
+        "reference_answers",
+        "expected_answer",
+        "expected_answers",
+        "correct_answer"
+    ],
+
+    "metadata": [
+        "metadata",
+        "meta_data",
+        "meta",
+        "information",
+        "additional_metadata"
+    ],
+
+    # Optional fields.
+    # These are NOT required for the DRDO dataset.
     "latency": [
         "latency",
+        "latency_ms",
         "response_time",
         "response_time_ms",
-        "latency_ms",
+        "response_latency",
+        "response_latency_ms",
+        "duration_ms"
     ],
+
+    "status": [
+        "status",
+        "response_status",
+        "request_status",
+        "success",
+        "is_success",
+        "error",
+        "failed"
+    ]
 }
 
 
-def normalize_column_name(name):
-    """Convert a column name into a comparable format."""
+# ============================================================
+# NORMALIZE COLUMN NAME
+# ============================================================
+
+def normalize_column_name(column_name):
+
     return (
-        str(name)
+        str(column_name)
         .strip()
         .lower()
         .replace(" ", "_")
@@ -57,154 +103,272 @@ def normalize_column_name(name):
     )
 
 
+# ============================================================
+# DETECT COLUMNS
+# ============================================================
+
 def detect_columns(df):
-    """
-    Automatically detect standard AI evaluation fields
-    from dataset column names.
-    """
 
-    detected = {}
+    if not isinstance(df, pd.DataFrame):
 
-    normalized_columns = {
-        normalize_column_name(column): column
-        for column in df.columns
-    }
+        raise TypeError(
+            "Input must be a pandas DataFrame."
+        )
 
-    for standard_field, aliases in COLUMN_ALIASES.items():
+    detected_columns = {}
+
+    normalized_columns = {}
+
+    for column in df.columns:
+
+        normalized_name = normalize_column_name(
+            column
+        )
+
+        normalized_columns[
+            normalized_name
+        ] = column
+
+    # --------------------------------------------------------
+    # Match logical fields
+    # --------------------------------------------------------
+
+    for field, aliases in FIELD_ALIASES.items():
+
         for alias in aliases:
-            if alias in normalized_columns:
-                detected[standard_field] = normalized_columns[alias]
+
+            normalized_alias = (
+                normalize_column_name(alias)
+            )
+
+            if normalized_alias in normalized_columns:
+
+                detected_columns[field] = (
+                    normalized_columns[
+                        normalized_alias
+                    ]
+                )
+
                 break
 
-    return detected
+    return detected_columns
 
+
+# ============================================================
+# VALIDATE DATASET
+# ============================================================
 
 def validate_dataset(df):
-    """
-    Validate the uploaded dataset and determine
-    which evaluation capabilities are available.
-    """
 
-    errors = []
+    if not isinstance(df, pd.DataFrame):
+
+        raise TypeError(
+            "Input must be a pandas DataFrame."
+        )
+
+    detected_columns = detect_columns(df)
+
     warnings = []
+    errors = []
 
-    if df.empty:
-        errors.append("Dataset is empty.")
+    # --------------------------------------------------------
+    # Required fields
+    # --------------------------------------------------------
 
-    if len(df.columns) == 0:
-        errors.append("Dataset contains no columns.")
+    required_fields = [
+        "question",
+        "context",
+        "answer",
+        "ground_truth"
+    ]
 
-    detected = detect_columns(df)
+    missing_required = [
+        field
+        for field in required_fields
+        if field not in detected_columns
+    ]
 
-    # Question is required for most answer-quality evaluation.
-    if "question" not in detected:
-        warnings.append(
-            "Question/query column was not detected."
+    if missing_required:
+
+        errors.append(
+            "Missing required fields: "
+            + ", ".join(missing_required)
         )
 
-    # Answer is required for answer-quality evaluation.
-    if "answer" not in detected:
+    # --------------------------------------------------------
+    # Metadata is expected by the DRDO dataset
+    # but we do not make it mandatory because some
+    # evaluation datasets may not contain it.
+    # --------------------------------------------------------
+
+    if "metadata" not in detected_columns:
+
         warnings.append(
-            "Answer/response column was not detected."
+            "Metadata field was not detected. "
+            "Metrics that depend on metadata will be unavailable."
         )
 
-    # Context and ground truth are needed for several RAG metrics.
-    if "context" not in detected:
+    # --------------------------------------------------------
+    # Optional fields
+    # --------------------------------------------------------
+
+    if "latency" not in detected_columns:
+
         warnings.append(
-            "Context/document column was not detected."
+            "Latency field was not detected. "
+            "Latency metrics cannot be calculated directly "
+            "unless latency information exists inside metadata."
         )
 
-    if "ground_truth" not in detected:
+    if "status" not in detected_columns:
+
         warnings.append(
-            "Ground-truth/reference column was not detected."
+            "Status field was not detected. "
+            "Success/failure metrics may be unavailable."
         )
-
-    capabilities = {
-        "answer_relevancy": (
-            "question" in detected and
-            "answer" in detected
-        ),
-        "answer_correctness": (
-            "answer" in detected and
-            "ground_truth" in detected
-        ),
-        "faithfulness": (
-            "answer" in detected and
-            "context" in detected
-        ),
-        "context_metrics": (
-            "context" in detected and
-            "ground_truth" in detected
-        ),
-        "latency": (
-            "latency" in detected
-        ),
-    }
-
-    # Retrieval metrics require ranked retrieval information.
-    retrieval_metrics_available = False
-
-    if "context" in detected:
-        context_column = detected["context"]
-
-        # A context field by itself does not guarantee that
-        # ranked retrieval evaluation is possible.
-        sample_value = df[context_column].dropna()
-
-        if not sample_value.empty:
-            first_value = sample_value.iloc[0]
-
-            if isinstance(first_value, (list, tuple)):
-                retrieval_metrics_available = True
-
-    capabilities.update({
-        "precision_at_k": retrieval_metrics_available,
-        "recall_at_k": retrieval_metrics_available,
-        "mrr": retrieval_metrics_available,
-        "ndcg": retrieval_metrics_available,
-        "hit_rate": retrieval_metrics_available,
-    })
 
     return {
+
         "valid": len(errors) == 0,
-        "rows": len(df),
-        "columns": list(df.columns),
-        "detected_columns": detected,
-        "capabilities": capabilities,
-        "errors": errors,
-        "warnings": warnings,
+
+        "detected_columns":
+            detected_columns,
+
+        "missing_required":
+            missing_required,
+
+        "warnings":
+            warnings,
+
+        "errors":
+            errors
+
     }
 
+
+# ============================================================
+# HUMAN-READABLE SUMMARY
+# ============================================================
+
+def print_schema_summary(validation_result):
+
+    print("\n========== AITrustEval Schema ==========\n")
+
+    detected_columns = validation_result.get(
+        "detected_columns",
+        {}
+    )
+
+    if detected_columns:
+
+        print("Detected fields:")
+
+        for field, column in detected_columns.items():
+
+            print(
+                f"  {field:15} -> {column}"
+            )
+
+    else:
+
+        print(
+            "No compatible fields detected."
+        )
+
+    print()
+
+    missing_required = validation_result.get(
+        "missing_required",
+        []
+    )
+
+    if missing_required:
+
+        print("Missing required fields:")
+
+        for field in missing_required:
+
+            print(
+                f"  - {field}"
+            )
+
+    else:
+
+        print(
+            "All required fields detected."
+        )
+
+    print()
+
+    warnings = validation_result.get(
+        "warnings",
+        []
+    )
+
+    if warnings:
+
+        print("Warnings:")
+
+        for warning in warnings:
+
+            print(
+                f"  - {warning}"
+            )
+
+    print()
+
+    errors = validation_result.get(
+        "errors",
+        []
+    )
+
+    if errors:
+
+        print("Errors:")
+
+        for error in errors:
+
+            print(
+                f"  - {error}"
+            )
+
+    print()
+
+
+# ============================================================
+# TEST
+# ============================================================
 
 if __name__ == "__main__":
 
-    print("========== DATASET SCHEMA DETECTOR ==========")
+    test_df = pd.DataFrame({
 
-    input_file = "data/sample/ragas_eval_30.csv"
+        "question": [
+            "What is TCP?"
+        ],
 
-    df = pd.read_csv(input_file)
+        "context": [
+            "TCP is a reliable transport protocol."
+        ],
 
-    result = validate_dataset(df)
+        "answer": [
+            "TCP is a reliable transport protocol."
+        ],
 
-    print("\nDataset:")
-    print(f"Rows: {result['rows']}")
-    print(f"Columns: {result['columns']}")
+        "metadata": [
+            '{"source": "test", "model": "mistral"}'
+        ],
 
-    print("\nDetected Columns:")
-    for field, column in result["detected_columns"].items():
-        print(f"  {field} -> {column}")
+        "ground_truth": [
+            "TCP is a reliable transport layer protocol."
+        ]
 
-    print("\nMetric Capabilities:")
-    for metric, available in result["capabilities"].items():
-        status = "AVAILABLE" if available else "NOT AVAILABLE"
-        print(f"  {metric}: {status}")
+    })
 
-    print("\nWarnings:")
-    for warning in result["warnings"]:
-        print(f"  - {warning}")
+    result = validate_dataset(
+        test_df
+    )
 
-    print("\nErrors:")
-    for error in result["errors"]:
-        print(f"  - {error}")
-
-    print("\n========== TEST COMPLETE ==========")
+    print_schema_summary(
+        result
+    )
